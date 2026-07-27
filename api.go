@@ -39,7 +39,7 @@ func newAPIHandler(manager *taskManager, staticFiles http.Handler) http.Handler 
 			writeError(writer, http.StatusBadRequest, "请求内容无效")
 			return
 		}
-		created, err := manager.create(payload.SourceURL, payload.Referer, payload.Cookie, payload.UserAgent, payload.Mode, payload.OutputName, payload.OutputDir, payload.CacheDir, payload.DeleteCache)
+		created, err := manager.create(payload.SourceURL, payload.Referer, payload.Cookie, payload.UserAgent, payload.Mode, payload.OutputName, payload.OutputDir, payload.CacheDir, payload.DeleteCache, normalizeConcurrentDownloads(payload.ConcurrentDownloads))
 		if err != nil {
 			writeError(writer, http.StatusBadRequest, err.Error())
 			return

@@ -12,7 +12,7 @@ import (
 	"sync"
 )
 
-func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, onProgress func(float64), onProcess func(*os.Process)) error {
+func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, concurrentDownloads bool, onProgress func(float64), onProcess func(*os.Process), onLog func(string, string)) error {
 	executable := ffmpegExecutable()
 	if _, err := exec.LookPath(executable); err != nil {
 		return errors.New("未找到 ffmpeg，请检查 FFMPEG_PATH 或系统 PATH 后重试")
@@ -22,6 +22,7 @@ func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, 
 		"-progress", "pipe:1",
 		"-rw_timeout", "30000000",
 	}
+	arguments = append(arguments, hlsInputOptions(sourceURL, concurrentDownloads)...)
 	arguments = append(arguments,
 		"-i", sourceURL,
 		"-map", "0",
@@ -44,7 +45,9 @@ func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 ffmpeg 失败: %w", err)
 	}
+	onLog("info", "FFmpeg 进程已启动")
 	onProcess(cmd.Process)
+	defer onProcess(nil)
 
 	var wait sync.WaitGroup
 	var stderrText string
@@ -55,8 +58,7 @@ func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, 
 	}()
 	go func() {
 		defer wait.Done()
-		data, _ := io.ReadAll(io.LimitReader(stderr, 16*1024))
-		stderrText = string(data)
+		stderrText = readFFmpegStderr(stderr, onLog)
 	}()
 	err = cmd.Wait()
 	wait.Wait()
@@ -71,6 +73,21 @@ func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, 
 		return fmt.Errorf("ffmpeg 执行失败: %s", message)
 	}
 	return nil
+}
+
+func isHTTPSource(sourceURL string) bool {
+	return strings.HasPrefix(sourceURL, "http://") || strings.HasPrefix(sourceURL, "https://")
+}
+
+func hlsInputOptions(sourceURL string, concurrentDownloads bool) []string {
+	if !isHTTPSource(sourceURL) {
+		return nil
+	}
+	options := []string{"-http_persistent", "1", "-seg_max_retry", "3"}
+	if concurrentDownloads {
+		return append(options, "-http_multiple", "1")
+	}
+	return append(options, "-http_multiple", "0")
 }
 
 func ffmpegExecutable() string {
@@ -106,4 +123,26 @@ func lastMeaningfulLine(text string) string {
 		}
 	}
 	return ""
+}
+
+func readFFmpegStderr(reader io.Reader, onLog func(string, string)) string {
+	const maxErrorBytes = 16 * 1024
+	var output strings.Builder
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4*1024), 128*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			onLog("ffmpeg", line)
+			if output.Len() < maxErrorBytes {
+				remaining := maxErrorBytes - output.Len()
+				if len(line) > remaining {
+					line = line[:remaining]
+				}
+				output.WriteString(line)
+				output.WriteByte('\n')
+			}
+		}
+	}
+	return output.String()
 }

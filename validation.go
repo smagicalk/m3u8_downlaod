@@ -77,6 +77,10 @@ func normalizeMode(raw string) string {
 	return mode
 }
 
+func normalizeConcurrentDownloads(raw *bool) bool {
+	return raw == nil || *raw
+}
+
 func resolveDirectory(raw, fallback string) (string, error) {
 	directory := strings.TrimSpace(raw)
 	if directory == "" {

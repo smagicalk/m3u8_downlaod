@@ -41,6 +41,13 @@
     .meta { color: #667780; font-size: 13px; }
     .progress { height: 5px; overflow: hidden; background: #dbe3e7; margin-top: 9px; }
     .progress > span { display: block; height: 100%; background: #087f5b; transition: width .2s ease; }
+    .task-log { margin-top: 10px; border-top: 1px solid #dbe3e7; color: #52636b; font-size: 12px; }
+    .task-log summary { padding: 8px 0; cursor: pointer; font-weight: 650; }
+    .task-log-list { display: grid; gap: 5px; max-height: 180px; overflow: auto; padding: 0 0 10px; font-family: Consolas, "Cascadia Mono", monospace; }
+    .task-log-line { overflow-wrap: anywhere; }
+    .task-log-time { color: #7b8b92; margin-right: 7px; }
+    .task-log-line.error { color: #b42318; }
+    .task-log-line.warning { color: #a15c00; }
     .state { display: flex; align-items: center; gap: 12px; }
     .badge { display: inline-flex; min-width: 66px; justify-content: center; padding: 5px 8px; border-radius: 4px; background: #e5ecef; color: #34434a; font-size: 12px; font-weight: 650; }
     .badge.running { background: #d7efe8; color: #056b4c; }
@@ -105,6 +112,10 @@
           <label>缓存处理</label>
           <label class="check" for="delete-cache"><input id="delete-cache" name="deleteCache" type="checkbox" checked> 合并成功后删除缓存</label>
         </div>
+        <div class="field check-field">
+          <label>网络连接</label>
+          <label class="check" for="concurrent-downloads"><input id="concurrent-downloads" name="concurrentDownloads" type="checkbox" checked> 多连接下载 HLS 分片</label>
+        </div>
       </div>
     </form>
     <p id="notice" class="notice" role="alert"></p>
@@ -124,6 +135,7 @@
     const outputDirectoryInput = document.querySelector('#output-directory');
     const cacheDirectoryInput = document.querySelector('#cache-directory');
     const deleteCacheInput = document.querySelector('#delete-cache');
+    const concurrentDownloadsInput = document.querySelector('#concurrent-downloads');
     const submit = document.querySelector('#submit');
     const notice = document.querySelector('#notice');
     const tasks = document.querySelector('#tasks');
@@ -151,6 +163,11 @@
       return `${phaseLabels[item.phase] || '已处理'} ${formatTime(item.progressSec)}${total}`;
     }
 
+    function formatLogTime(value) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? '--:--:--' : date.toLocaleTimeString('zh-CN', { hour12: false });
+    }
+
     async function request(path, options) {
       const response = await fetch(path, options);
       const body = await response.json();
@@ -173,7 +190,8 @@
         const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
         const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
         const stateLabel = item.status === 'paused' ? '已暂停' : labels[item.status];
-        return `<article class="task"><div><h3>${escapeHTML(item.outputName)}</h3><div class="meta">${formatProgress(item)} · ${escapeHTML(item.outputDirectory)}${download}${error}</div><div class="progress" aria-label="下载进度"><span style="width: ${percent}%"></span></div></div><div class="state"><span class="badge ${item.status}">${stateLabel}</span>${pause}${resume}${cancel}</div></article>`;
+        const logs = item.logs?.length ? `<details class="task-log"><summary>运行日志 (${item.logs.length})</summary><div class="task-log-list">${item.logs.map((entry) => `<div class="task-log-line ${escapeHTML(entry.level)}"><span class="task-log-time">${formatLogTime(entry.at)}</span>${escapeHTML(entry.message)}</div>`).join('')}</div></details>` : '';
+        return `<article class="task"><div><h3>${escapeHTML(item.outputName)}</h3><div class="meta">${formatProgress(item)} · ${escapeHTML(item.outputDirectory)}${download}${error}</div><div class="progress" aria-label="下载进度"><span style="width: ${percent}%"></span></div>${logs}</div><div class="state"><span class="badge ${item.status}">${stateLabel}</span>${pause}${resume}${cancel}</div></article>`;
       }).join('');
     }
 
@@ -204,7 +222,7 @@
       notice.textContent = '';
       submit.disabled = true;
       try {
-        await request('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceUrl: sourceInput.value, referer: refererInput.value, cookie: cookieInput.value, userAgent: userAgentInput.value, mode: modeInput.value, outputName: outputInput.value, outputDirectory: outputDirectoryInput.value, cacheDirectory: cacheDirectoryInput.value, deleteCache: deleteCacheInput.checked }) });
+        await request('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceUrl: sourceInput.value, referer: refererInput.value, cookie: cookieInput.value, userAgent: userAgentInput.value, mode: modeInput.value, outputName: outputInput.value, outputDirectory: outputDirectoryInput.value, cacheDirectory: cacheDirectoryInput.value, deleteCache: deleteCacheInput.checked, concurrentDownloads: concurrentDownloadsInput.checked }) });
         outputInput.value = '';
         await refresh();
       } catch (error) { notice.textContent = error.message; }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,6 +76,26 @@ func TestModeAndPlaylistDuration(t *testing.T) {
 	playlist := "#EXTM3U\n#EXTINF:4.5,\npart-1.ts\n#EXTINF:2,\npart-2.ts\n"
 	if got := playlistDuration(playlist); got != 6.5 {
 		t.Fatalf("playlistDuration() = %f, want 6.5", got)
+	}
+}
+
+func TestNormalizeConcurrentDownloads(t *testing.T) {
+	if !normalizeConcurrentDownloads(nil) {
+		t.Fatal("missing concurrent download option must default to enabled")
+	}
+	disabled := false
+	if normalizeConcurrentDownloads(&disabled) {
+		t.Fatal("explicitly disabled concurrent download option must remain disabled")
+	}
+}
+
+func TestConcurrentDownloadsDefaultsToEnabledForAPIPayload(t *testing.T) {
+	var payload createRequest
+	if err := json.Unmarshal([]byte(`{"sourceUrl":"https://example.com/video.m3u8"}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !normalizeConcurrentDownloads(payload.ConcurrentDownloads) {
+		t.Fatal("API payload without concurrentDownloads must default to enabled")
 	}
 }
 
@@ -179,5 +200,43 @@ func TestCancelledTaskCannotRestart(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Fatal("the existing context must not be cancelled by a stale runner")
+	}
+}
+
+func TestTaskLogsAreBoundedAndCopied(t *testing.T) {
+	manager := newTaskManager(t.TempDir())
+	manager.tasks["test"] = &task{ID: "test"}
+	for index := 0; index < maxTaskLogEntries+2; index++ {
+		manager.addLog("test", "info", "log entry")
+	}
+
+	result := manager.snapshot("test")
+	if len(result.Logs) != maxTaskLogEntries {
+		t.Fatalf("log count = %d, want %d", len(result.Logs), maxTaskLogEntries)
+	}
+	result.Logs[0].Message = "changed outside manager"
+	if manager.snapshot("test").Logs[0].Message == "changed outside manager" {
+		t.Fatal("task log snapshot must not share the manager slice")
+	}
+}
+
+func TestIsHTTPSource(t *testing.T) {
+	if !isHTTPSource("http://127.0.0.1:8080/playlist.m3u8") || !isHTTPSource("https://example.com/video.m3u8") {
+		t.Fatal("HTTP sources must enable HLS connection options")
+	}
+	if isHTTPSource("C:/cache/video.ts") {
+		t.Fatal("local files must not receive HLS connection options")
+	}
+}
+
+func TestHLSInputOptions(t *testing.T) {
+	options := strings.Join(hlsInputOptions("http://127.0.0.1:8080/playlist.m3u8", true), " ")
+	for _, expected := range []string{"-http_persistent 1", "-http_multiple 1", "-seg_max_retry 3"} {
+		if !strings.Contains(options, expected) {
+			t.Fatalf("HLS options missing %q: %s", expected, options)
+		}
+	}
+	if got := hlsInputOptions("C:/cache/video.ts", true); got != nil {
+		t.Fatalf("local input options = %v, want nil", got)
 	}
 }

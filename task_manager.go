@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -33,7 +32,7 @@ func newTaskManager(outputDir string) *taskManager {
 	}
 }
 
-func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, outputName, outputDir, cacheDir string, deleteCache bool) (*task, error) {
+func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, outputName, outputDir, cacheDir string, deleteCache, concurrentDownloads bool) (*task, error) {
 	if err := validateSourceURL(sourceURL); err != nil {
 		return nil, err
 	}
@@ -75,22 +74,24 @@ func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, output
 		return nil, err
 	}
 	created := &task{
-		ID:          identifier,
-		SourceURL:   sourceURL,
-		Referer:     strings.TrimSpace(referer),
-		Cookie:      strings.TrimSpace(cookie),
-		UserAgent:   normalizeUserAgent(userAgent),
-		Mode:        normalizeMode(mode),
-		OutputName:  name,
-		OutputDir:   resolvedOutputDir,
-		CacheDir:    resolvedCacheDir,
-		DeleteCache: deleteCache,
-		OutputPath:  filepath.Join(resolvedOutputDir, name),
-		Status:      statusQueued,
-		CreatedAt:   time.Now(),
+		ID:                  identifier,
+		SourceURL:           sourceURL,
+		Referer:             strings.TrimSpace(referer),
+		Cookie:              strings.TrimSpace(cookie),
+		UserAgent:           normalizeUserAgent(userAgent),
+		Mode:                normalizeMode(mode),
+		OutputName:          name,
+		OutputDir:           resolvedOutputDir,
+		CacheDir:            resolvedCacheDir,
+		DeleteCache:         deleteCache,
+		ConcurrentDownloads: concurrentDownloads,
+		OutputPath:          filepath.Join(resolvedOutputDir, name),
+		Status:              statusQueued,
+		CreatedAt:           time.Now(),
 	}
 
 	m.mu.Lock()
+	appendTaskLog(created, "info", "任务已创建，等待开始")
 	m.tasks[identifier] = created
 	m.mu.Unlock()
 
@@ -132,14 +133,21 @@ func (m *taskManager) run(identifier string) {
 	mode := current.Mode
 	cacheDir := current.CacheDir
 	deleteCache := current.DeleteCache
+	concurrentDownloads := current.ConcurrentDownloads
 	m.mu.RUnlock()
 
 	inputURL := m.playlistProxyURL(identifier)
 	if inputURL == "" {
+		m.addLog(identifier, "error", "本地 HLS 代理未初始化")
 		m.finish(identifier, statusFailed, "本地 HLS 代理未初始化")
 		return
 	}
 	m.setPhase(identifier, phaseForMode(mode))
+	if concurrentDownloads {
+		m.addLog(identifier, "info", "已启用 HLS 多连接分片下载和持久连接")
+	} else {
+		m.addLog(identifier, "info", "已禁用 HLS 多连接分片下载")
+	}
 	onProgress := func(seconds float64) {
 		m.mu.Lock()
 		if current := m.tasks[identifier]; current != nil {
@@ -148,24 +156,31 @@ func (m *taskManager) run(identifier string) {
 		m.mu.Unlock()
 	}
 	onProcess := func(process *os.Process) { m.setProcess(identifier, process) }
+	onLog := func(level, message string) { m.addLog(identifier, level, message) }
 	defer m.setProcess(identifier, nil)
 	if mode == modeDownloadFirst {
 		temporaryPath := filepath.Join(cacheDir, "."+identifier+".ts")
-		err := runFFmpeg(ctx, inputURL, temporaryPath, "mpegts", onProgress, onProcess)
+		m.addLog(identifier, "info", "开始下载分片到临时缓存")
+		err := runFFmpeg(ctx, inputURL, temporaryPath, "mpegts", concurrentDownloads, onProgress, onProcess, onLog)
 		if err == nil {
 			m.setPhase(identifier, "merging")
-			err = runFFmpeg(ctx, temporaryPath, outputPath, "mp4", onProgress, onProcess)
+			m.addLog(identifier, "info", "分片下载完成，开始合并 MP4")
+			err = runFFmpeg(ctx, temporaryPath, outputPath, "mp4", false, onProgress, onProcess, onLog)
 		}
 		if err == nil && deleteCache {
 			_ = os.Remove(temporaryPath)
+			m.addLog(identifier, "info", "合并成功，已删除临时缓存")
 		}
 		if err != nil {
 			m.finish(identifier, statusFailed, err.Error())
 			return
 		}
-	} else if err := runFFmpeg(ctx, inputURL, outputPath, "mp4", onProgress, onProcess); err != nil {
-		m.finish(identifier, statusFailed, err.Error())
-		return
+	} else {
+		m.addLog(identifier, "info", "开始边下载边合并")
+		if err := runFFmpeg(ctx, inputURL, outputPath, "mp4", concurrentDownloads, onProgress, onProcess, onLog); err != nil {
+			m.finish(identifier, statusFailed, err.Error())
+			return
+		}
 	}
 	m.finish(identifier, statusCompleted, "")
 }
@@ -216,6 +231,11 @@ func (m *taskManager) finish(identifier string, status taskStatus, message strin
 		current.Status = status
 		current.Error = message
 		current.FinishedAt = &finished
+		if status == statusCompleted {
+			appendTaskLog(current, "info", "任务已完成")
+		} else if message != "" {
+			appendTaskLog(current, "error", message)
+		}
 	}
 }
 
@@ -227,6 +247,7 @@ func (m *taskManager) snapshot(identifier string) *task {
 		return nil
 	}
 	copy := *current
+	copy.Logs = append([]taskLog(nil), current.Logs...)
 	return &copy
 }
 
@@ -236,6 +257,7 @@ func (m *taskManager) all() []*task {
 	items := make([]*task, 0, len(m.tasks))
 	for _, current := range m.tasks {
 		copy := *current
+		copy.Logs = append([]taskLog(nil), current.Logs...)
 		items = append(items, &copy)
 	}
 	return items
@@ -254,6 +276,7 @@ func (m *taskManager) cancel(identifier string) bool {
 	current.Status = statusCancelled
 	finished := time.Now()
 	current.FinishedAt = &finished
+	appendTaskLog(current, "warning", "任务已取消")
 	if cancel := m.cancels[identifier]; cancel != nil {
 		cancel()
 	}
@@ -275,6 +298,7 @@ func (m *taskManager) pause(identifier string) bool {
 	defer m.mu.Unlock()
 	if current := m.tasks[identifier]; current != nil && current.Status == statusRunning {
 		current.Status = statusPaused
+		appendTaskLog(current, "info", "任务已暂停")
 		return true
 	}
 	return false
@@ -295,9 +319,8 @@ func (m *taskManager) resume(identifier string) bool {
 	defer m.mu.Unlock()
 	if current := m.tasks[identifier]; current != nil && current.Status == statusPaused {
 		current.Status = statusRunning
+		appendTaskLog(current, "info", "任务已继续")
 		return true
 	}
 	return false
 }
-
-var errTaskNotFound = errors.New("task not found")

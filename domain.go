@@ -19,37 +19,40 @@ const (
 )
 
 type task struct {
-	ID          string     `json:"id"`
-	SourceURL   string     `json:"sourceUrl"`
-	Referer     string     `json:"-"`
-	Cookie      string     `json:"-"`
-	UserAgent   string     `json:"-"`
-	Mode        string     `json:"mode"`
-	Phase       string     `json:"phase,omitempty"`
-	OutputName  string     `json:"outputName"`
-	OutputDir   string     `json:"outputDirectory"`
-	CacheDir    string     `json:"cacheDirectory,omitempty"`
-	DeleteCache bool       `json:"deleteCache"`
-	OutputPath  string     `json:"-"`
-	Status      taskStatus `json:"status"`
-	ProgressSec float64    `json:"progressSec"`
-	DurationSec float64    `json:"durationSec"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	StartedAt   *time.Time `json:"startedAt,omitempty"`
-	FinishedAt  *time.Time `json:"finishedAt,omitempty"`
-	Error       string     `json:"error,omitempty"`
+	ID                  string     `json:"id"`
+	SourceURL           string     `json:"sourceUrl"`
+	Referer             string     `json:"-"`
+	Cookie              string     `json:"-"`
+	UserAgent           string     `json:"-"`
+	Mode                string     `json:"mode"`
+	Phase               string     `json:"phase,omitempty"`
+	OutputName          string     `json:"outputName"`
+	OutputDir           string     `json:"outputDirectory"`
+	CacheDir            string     `json:"cacheDirectory,omitempty"`
+	DeleteCache         bool       `json:"deleteCache"`
+	ConcurrentDownloads bool       `json:"concurrentDownloads"`
+	OutputPath          string     `json:"-"`
+	Status              taskStatus `json:"status"`
+	ProgressSec         float64    `json:"progressSec"`
+	DurationSec         float64    `json:"durationSec"`
+	Logs                []taskLog  `json:"logs"`
+	CreatedAt           time.Time  `json:"createdAt"`
+	StartedAt           *time.Time `json:"startedAt,omitempty"`
+	FinishedAt          *time.Time `json:"finishedAt,omitempty"`
+	Error               string     `json:"error,omitempty"`
 }
 
 type createRequest struct {
-	SourceURL   string `json:"sourceUrl"`
-	Referer     string `json:"referer"`
-	Cookie      string `json:"cookie"`
-	UserAgent   string `json:"userAgent"`
-	Mode        string `json:"mode"`
-	OutputDir   string `json:"outputDirectory"`
-	CacheDir    string `json:"cacheDirectory"`
-	DeleteCache bool   `json:"deleteCache"`
-	OutputName  string `json:"outputName"`
+	SourceURL           string `json:"sourceUrl"`
+	Referer             string `json:"referer"`
+	Cookie              string `json:"cookie"`
+	UserAgent           string `json:"userAgent"`
+	Mode                string `json:"mode"`
+	OutputDir           string `json:"outputDirectory"`
+	CacheDir            string `json:"cacheDirectory"`
+	DeleteCache         bool   `json:"deleteCache"`
+	ConcurrentDownloads *bool  `json:"concurrentDownloads"`
+	OutputName          string `json:"outputName"`
 }
 
 type directorySelectionRequest struct {

@@ -16,8 +16,10 @@ func (m *taskManager) servePlaylistProxy(writer http.ResponseWriter, request *ht
 }
 
 func (m *taskManager) serveResourceProxy(writer http.ResponseWriter, request *http.Request) {
+	identifier := request.PathValue("id")
 	resourceURL, err := decodeProxyURL(request.URL.Query().Get("resource"))
 	if err != nil {
+		m.addLog(identifier, "warning", "代理资源地址无效")
 		writeError(writer, http.StatusBadRequest, "代理资源地址无效")
 		return
 	}
@@ -39,6 +41,7 @@ func (m *taskManager) serveProxyResource(writer http.ResponseWriter, request *ht
 		resourceURL = sourceURL
 	}
 	if _, err := parseHTTPURL(resourceURL); err != nil {
+		m.addLog(identifier, "warning", "代理资源地址无效")
 		writeError(writer, http.StatusBadRequest, "代理资源地址无效")
 		return
 	}
@@ -51,11 +54,13 @@ func (m *taskManager) serveProxyResource(writer http.ResponseWriter, request *ht
 	applyBrowserHeaders(remoteRequest, referer, cookie, userAgent)
 	response, err := m.httpClient.Do(remoteRequest)
 	if err != nil {
+		m.addLog(identifier, "error", "HLS 代理无法连接远程资源")
 		writeError(writer, http.StatusBadGateway, "获取远程资源失败")
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		m.addLog(identifier, "error", fmt.Sprintf("远程服务器返回 HTTP %d", response.StatusCode))
 		writeError(writer, http.StatusBadGateway, fmt.Sprintf("远程服务器返回 HTTP %d", response.StatusCode))
 		return
 	}
@@ -63,6 +68,7 @@ func (m *taskManager) serveProxyResource(writer http.ResponseWriter, request *ht
 	if isPlaylist(resourceURL, response.Header.Get("Content-Type")) {
 		content, err := io.ReadAll(io.LimitReader(response.Body, 16*1024*1024))
 		if err != nil {
+			m.addLog(identifier, "error", "读取播放清单失败")
 			writeError(writer, http.StatusBadGateway, "读取播放清单失败")
 			return
 		}
