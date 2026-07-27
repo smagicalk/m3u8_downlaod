@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -80,7 +81,7 @@ func downloadHLS(ctx context.Context, config hlsDownloadConfig, callbacks hlsDow
 		return nil, fmt.Errorf("创建任务缓存目录失败: %w", err)
 	}
 	logHLS(callbacks, "info", "正在获取 HLS 播放清单")
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := newHLSHTTPClient(config.WorkerCount)
 	playlist, err := fetchPlaylist(ctx, client, config, config.SourceURL)
 	if err != nil {
 		return nil, err
@@ -108,6 +109,23 @@ func downloadHLS(ctx context.Context, config hlsDownloadConfig, callbacks hlsDow
 		return nil, err
 	}
 	return &hlsDownloadResult{PlaylistPath: rootPlaylistPath, CachePath: cachePath, DurationSec: durationSec}, nil
+}
+
+func newHLSHTTPClient(workerCount int) *http.Client {
+	return &http.Client{
+		Timeout: 45 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxConnsPerHost:       workerCount,
+			MaxIdleConnsPerHost:   workerCount,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			ForceAttemptHTTP2:     false,
+			TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		},
+	}
 }
 
 func validateWorkerCount(workerCount int) error {
@@ -631,6 +649,9 @@ func downloadResourceOnce(ctx context.Context, client *http.Client, config hlsDo
 	}
 	response, err := client.Do(request)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, errors.New("远程分片请求超时")
+		}
 		return 0, errors.New("获取远程分片失败")
 	}
 	defer response.Body.Close()

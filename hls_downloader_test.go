@@ -109,3 +109,16 @@ func TestPlanMediaPlaylistRejectsUnsupportedHLS(t *testing.T) {
 		t.Fatalf("unsupported HLS error = %v", err)
 	}
 }
+
+func TestHLSHTTPClientUsesHTTP11Connections(t *testing.T) {
+	transport, ok := newHLSHTTPClient(8).Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("HLS client must use an HTTP transport")
+	}
+	if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil {
+		t.Fatal("HLS client must disable HTTP/2 for segment compatibility")
+	}
+	if transport.MaxConnsPerHost != 8 || transport.MaxIdleConnsPerHost != 8 {
+		t.Fatalf("connection limits = %d/%d, want 8/8", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+}

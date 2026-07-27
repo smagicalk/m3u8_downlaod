@@ -37,13 +37,21 @@
     h2 { margin: 18px 0 12px; font-size: 16px; }
     .empty { color: #667780; padding: 26px 0; border-top: 1px solid #dbe3e7; }
     .task { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; border-top: 1px solid #dbe3e7; padding: 16px 0; }
+    .task[role="button"] { cursor: pointer; }
+    .task[role="button"]:hover, .task[role="button"]:focus { background: #edf3f1; outline: none; }
     .task h3 { margin: 0 0 6px; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     .meta { color: #667780; font-size: 13px; }
     .progress { height: 5px; overflow: hidden; background: #dbe3e7; margin-top: 9px; }
     .progress > span { display: block; height: 100%; background: #087f5b; transition: width .2s ease; }
-    .task-log { margin-top: 10px; border-top: 1px solid #dbe3e7; color: #52636b; font-size: 12px; }
-    .task-log summary { padding: 8px 0; cursor: pointer; font-weight: 650; }
-    .task-log-list { display: grid; gap: 5px; max-height: 180px; overflow: auto; padding: 0 0 10px; font-family: Consolas, "Cascadia Mono", monospace; }
+    .detail-toolbar { display: flex; align-items: center; gap: 12px; margin: 18px 0 12px; }
+    .detail-toolbar h2 { margin: 0; overflow-wrap: anywhere; }
+    .detail-back { min-height: 34px; width: 34px; padding: 0; background: transparent; border: 1px solid #9eafb8; color: #34434a; font-size: 18px; }
+    .detail-back:hover { background: #e5ecef; }
+    .detail-summary { display: grid; gap: 10px; padding: 14px 0; border-top: 1px solid #dbe3e7; border-bottom: 1px solid #dbe3e7; }
+    .detail-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; color: #52636b; font-size: 13px; }
+    .detail-meta span { overflow-wrap: anywhere; }
+    .log-output { height: 360px; overflow: auto; margin-top: 14px; border: 1px solid #9eafb8; background: #f8fbfa; padding: 10px; color: #34434a; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; }
+    .log-output:empty::before { content: "暂无日志"; color: #7b8b92; }
     .task-log-line { overflow-wrap: anywhere; }
     .task-log-time { color: #7b8b92; margin-right: 7px; }
     .task-log-line.error { color: #b42318; }
@@ -59,7 +67,7 @@
     .cancel { color: #b42318; border-color: #d6a5a0; }
     .cancel:hover { background: #fde4e1; }
     a { color: #056b4c; }
-    @media (max-width: 720px) { main { width: min(100% - 24px, 980px); padding-top: 28px; } header { align-items: start; flex-direction: column; gap: 8px; } .primary-row, .request-grid { grid-template-columns: 1fr; } .field-wide { grid-column: auto; } .task { grid-template-columns: 1fr; gap: 10px; } .state { justify-content: space-between; } }
+    @media (max-width: 720px) { main { width: min(100% - 24px, 980px); padding-top: 28px; } header { align-items: start; flex-direction: column; gap: 8px; } .primary-row, .request-grid, .detail-meta { grid-template-columns: 1fr; } .field-wide { grid-column: auto; } .task { grid-template-columns: 1fr; gap: 10px; } .state { justify-content: space-between; } .log-output { height: 300px; } }
   </style>
 </head>
 <body>
@@ -117,10 +125,11 @@
       </div>
     </form>
     <p id="notice" class="notice" role="alert"></p>
-    <section aria-labelledby="tasks-heading">
+    <section id="tasks-section" aria-labelledby="tasks-heading">
       <h2 id="tasks-heading">任务</h2>
       <div id="tasks" class="empty">暂无任务</div>
     </section>
+    <section id="task-detail" hidden aria-labelledby="detail-heading"></section>
   </main>
   <script>
     const form = document.querySelector('#task-form');
@@ -136,9 +145,12 @@
     const submit = document.querySelector('#submit');
     const notice = document.querySelector('#notice');
     const tasks = document.querySelector('#tasks');
+    const tasksSection = document.querySelector('#tasks-section');
+    const taskDetail = document.querySelector('#task-detail');
     const health = document.querySelector('#health');
     const labels = { queued: '等待中', running: '下载中', completed: '已完成', failed: '失败', cancelled: '已取消' };
     const phaseLabels = { downloading: '下载分片', merging: '合并中' };
+    let selectedTaskID = null;
 
     function escapeHTML(value) {
       const element = document.createElement('span');
@@ -175,6 +187,31 @@
       return Number.isNaN(date.getTime()) ? '--:--:--' : date.toLocaleTimeString('zh-CN', { hour12: false });
     }
 
+    function taskPercent(item) {
+      if (item.phase === 'downloading' && item.totalSegments) return Math.min(100, Math.max(0, item.completedSegments / item.totalSegments * 100));
+      return item.durationSec ? Math.min(100, Math.max(0, item.progressSec / item.durationSec * 100)) : 0;
+    }
+
+    function taskActions(item) {
+      const pause = item.status === 'running' ? `<button class="action" type="button" data-action="pause" data-id="${item.id}">暂停</button>` : '';
+      const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
+      const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
+      return `${pause}${resume}${cancel}`;
+    }
+
+    function renderDetail(item) {
+      const previousOutput = taskDetail.querySelector('.log-output');
+      const previousScrollTop = previousOutput?.scrollTop || 0;
+      const shouldFollow = !previousOutput || previousOutput.scrollHeight - previousOutput.clientHeight - previousScrollTop < 24;
+      const download = item.status === 'completed' ? `<a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
+      const stateLabel = item.status === 'paused' ? '已暂停' : labels[item.status];
+      const error = item.error ? `<div class="meta">${escapeHTML(item.error)}</div>` : '';
+      const logs = item.logs?.map((entry) => `<div class="task-log-line ${escapeHTML(entry.level)}"><span class="task-log-time">${formatLogTime(entry.at)}</span>${escapeHTML(entry.message)}</div>`).join('') || '';
+      taskDetail.innerHTML = `<div class="detail-toolbar"><button class="detail-back" type="button" data-action="back" aria-label="返回任务列表" title="返回任务列表">&#8592;</button><h2 id="detail-heading">${escapeHTML(item.outputName)}</h2><span class="badge ${item.status}">${stateLabel}</span></div><div class="detail-summary"><div class="meta">${formatProgress(item)} · ${download}</div><div class="progress" aria-label="下载进度"><span style="width: ${taskPercent(item)}%"></span></div>${error}<div class="detail-meta"><span>保存目录：${escapeHTML(item.outputDirectory)}</span><span>缓存目录：${escapeHTML(item.cacheDirectory || '未设置')}</span><span>分片并发：${item.workerCount}</span><span>缓存清理：${item.deleteCache ? '合并后删除' : '保留'}</span></div><div class="state">${taskActions(item)}</div></div><div class="log-output" role="log" aria-live="polite">${logs}</div>`;
+      const output = taskDetail.querySelector('.log-output');
+      output.scrollTop = shouldFollow ? output.scrollHeight : previousScrollTop;
+    }
+
     async function request(path, options) {
       const response = await fetch(path, options);
       const body = await response.json();
@@ -183,6 +220,16 @@
     }
 
     function render(items) {
+      const selected = items.find((item) => item.id === selectedTaskID);
+      if (selected) {
+        tasksSection.hidden = true;
+        taskDetail.hidden = false;
+        renderDetail(selected);
+        return;
+      }
+      selectedTaskID = null;
+      tasksSection.hidden = false;
+      taskDetail.hidden = true;
       if (!items.length) {
         tasks.className = 'empty';
         tasks.textContent = '暂无任务';
@@ -192,13 +239,9 @@
       tasks.innerHTML = items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).map((item) => {
         const download = item.status === 'completed' ? ` · <a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
         const error = item.error ? ` · ${escapeHTML(item.error)}` : '';
-        const percent = item.phase === 'downloading' && item.totalSegments ? Math.min(100, Math.max(0, item.completedSegments / item.totalSegments * 100)) : item.durationSec ? Math.min(100, Math.max(0, item.progressSec / item.durationSec * 100)) : 0;
-        const pause = item.status === 'running' ? `<button class="action" type="button" data-action="pause" data-id="${item.id}">暂停</button>` : '';
-        const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
-        const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
+        const percent = taskPercent(item);
         const stateLabel = item.status === 'paused' ? '已暂停' : labels[item.status];
-        const logs = item.logs?.length ? `<details class="task-log"><summary>运行日志 (${item.logs.length})</summary><div class="task-log-list">${item.logs.map((entry) => `<div class="task-log-line ${escapeHTML(entry.level)}"><span class="task-log-time">${formatLogTime(entry.at)}</span>${escapeHTML(entry.message)}</div>`).join('')}</div></details>` : '';
-        return `<article class="task"><div><h3>${escapeHTML(item.outputName)}</h3><div class="meta">${formatProgress(item)} · ${escapeHTML(item.outputDirectory)}${download}${error}</div><div class="progress" aria-label="下载进度"><span style="width: ${percent}%"></span></div>${logs}</div><div class="state"><span class="badge ${item.status}">${stateLabel}</span>${pause}${resume}${cancel}</div></article>`;
+        return `<article class="task" role="button" tabindex="0" data-task-id="${item.id}"><div><h3>${escapeHTML(item.outputName)}</h3><div class="meta">${formatProgress(item)} · ${escapeHTML(item.outputDirectory)}${download}${error}</div><div class="progress" aria-label="下载进度"><span style="width: ${percent}%"></span></div></div><div class="state"><span class="badge ${item.status}">${stateLabel}</span>${taskActions(item)}</div></article>`;
       }).join('');
     }
 
@@ -245,6 +288,28 @@
 
     tasks.addEventListener('click', async (event) => {
       const { action, id } = event.target.dataset;
+      if (action && id) {
+        try { await request(`/api/tasks/${id}/${action}`, { method: 'POST' }); await refresh(); }
+        catch (error) { notice.textContent = error.message; }
+        return;
+      }
+      if (event.target.closest('a, button')) return;
+      const item = event.target.closest('[data-task-id]');
+      if (item) { selectedTaskID = item.dataset.taskId; render(await request('/api/tasks')); }
+    });
+
+    tasks.addEventListener('keydown', async (event) => {
+      if (!['Enter', ' '].includes(event.key)) return;
+      const item = event.target.closest('[data-task-id]');
+      if (!item) return;
+      event.preventDefault();
+      selectedTaskID = item.dataset.taskId;
+      render(await request('/api/tasks'));
+    });
+
+    taskDetail.addEventListener('click', async (event) => {
+      const { action, id } = event.target.dataset;
+      if (action === 'back') { selectedTaskID = null; await refresh(); return; }
       if (!action || !id) return;
       try { await request(`/api/tasks/${id}/${action}`, { method: 'POST' }); await refresh(); }
       catch (error) { notice.textContent = error.message; }
