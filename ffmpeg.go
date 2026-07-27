@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -23,6 +24,9 @@ func runFFmpeg(ctx context.Context, sourceURL, outputPath, outputFormat string, 
 		"-rw_timeout", "30000000",
 	}
 	arguments = append(arguments, hlsInputOptions(sourceURL, concurrentDownloads)...)
+	if !isHTTPSource(sourceURL) && strings.EqualFold(filepath.Ext(sourceURL), ".m3u8") {
+		arguments = append(arguments, "-protocol_whitelist", "file,crypto,data")
+	}
 	arguments = append(arguments,
 		"-i", sourceURL,
 		"-map", "0",

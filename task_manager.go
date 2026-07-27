@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -32,7 +33,7 @@ func newTaskManager(outputDir string) *taskManager {
 	}
 }
 
-func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, outputName, outputDir, cacheDir string, deleteCache, concurrentDownloads bool) (*task, error) {
+func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, outputName, outputDir, cacheDir string, deleteCache bool, workerCount int) (*task, error) {
 	if err := validateSourceURL(sourceURL); err != nil {
 		return nil, err
 	}
@@ -46,6 +47,9 @@ func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, output
 		return nil, err
 	}
 	if err := validateMode(mode); err != nil {
+		return nil, err
+	}
+	if err := validateWorkerCount(workerCount); err != nil {
 		return nil, err
 	}
 	name, err := normalizeOutputName(outputName)
@@ -63,31 +67,31 @@ func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, output
 	if err != nil {
 		return nil, err
 	}
-	if normalizeMode(mode) == modeDownloadFirst {
-		if err := os.MkdirAll(resolvedCacheDir, 0o755); err != nil {
-			return nil, fmt.Errorf("创建缓存目录失败: %w", err)
-		}
+	if err := os.MkdirAll(resolvedCacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("创建缓存目录失败: %w", err)
 	}
+	resumeKey := cacheKey(sourceURL, name)
 	name = nextAvailableName(resolvedOutputDir, name)
 	identifier, err := newTaskID()
 	if err != nil {
 		return nil, err
 	}
 	created := &task{
-		ID:                  identifier,
-		SourceURL:           sourceURL,
-		Referer:             strings.TrimSpace(referer),
-		Cookie:              strings.TrimSpace(cookie),
-		UserAgent:           normalizeUserAgent(userAgent),
-		Mode:                normalizeMode(mode),
-		OutputName:          name,
-		OutputDir:           resolvedOutputDir,
-		CacheDir:            resolvedCacheDir,
-		DeleteCache:         deleteCache,
-		ConcurrentDownloads: concurrentDownloads,
-		OutputPath:          filepath.Join(resolvedOutputDir, name),
-		Status:              statusQueued,
-		CreatedAt:           time.Now(),
+		ID:          identifier,
+		SourceURL:   sourceURL,
+		Referer:     strings.TrimSpace(referer),
+		Cookie:      strings.TrimSpace(cookie),
+		UserAgent:   normalizeUserAgent(userAgent),
+		Mode:        modeDownloadFirst,
+		OutputName:  name,
+		OutputDir:   resolvedOutputDir,
+		CacheDir:    resolvedCacheDir,
+		DeleteCache: deleteCache,
+		WorkerCount: workerCount,
+		CacheKey:    resumeKey,
+		OutputPath:  filepath.Join(resolvedOutputDir, name),
+		Status:      statusQueued,
+		CreatedAt:   time.Now(),
 	}
 
 	m.mu.Lock()
@@ -130,66 +134,62 @@ func (m *taskManager) run(identifier string) {
 		return
 	}
 	outputPath := current.OutputPath
-	mode := current.Mode
 	cacheDir := current.CacheDir
 	deleteCache := current.DeleteCache
-	concurrentDownloads := current.ConcurrentDownloads
+	sourceURL := current.SourceURL
+	referer := current.Referer
+	cookie := current.Cookie
+	userAgent := current.UserAgent
+	resumeKey := current.CacheKey
+	workerCount := current.WorkerCount
 	m.mu.RUnlock()
-
-	inputURL := m.playlistProxyURL(identifier)
-	if inputURL == "" {
-		m.addLog(identifier, "error", "本地 HLS 代理未初始化")
-		m.finish(identifier, statusFailed, "本地 HLS 代理未初始化")
-		return
-	}
-	m.setPhase(identifier, phaseForMode(mode))
-	if concurrentDownloads {
-		m.addLog(identifier, "info", "已启用 HLS 多连接分片下载和持久连接")
-	} else {
-		m.addLog(identifier, "info", "已禁用 HLS 多连接分片下载")
-	}
-	onProgress := func(seconds float64) {
-		m.mu.Lock()
-		if current := m.tasks[identifier]; current != nil {
-			current.ProgressSec = seconds
-		}
-		m.mu.Unlock()
+	m.setPhase(identifier, "downloading")
+	m.addLog(identifier, "info", fmt.Sprintf("开始使用 Go 下载器，分片并发数为 %d", workerCount))
+	onProgress := func(completedSegments, totalSegments int, downloadedBytes int64, completedSeconds, totalSeconds float64) {
+		m.setDownloadProgress(identifier, completedSegments, totalSegments, downloadedBytes, completedSeconds, totalSeconds)
 	}
 	onProcess := func(process *os.Process) { m.setProcess(identifier, process) }
 	onLog := func(level, message string) { m.addLog(identifier, level, message) }
 	defer m.setProcess(identifier, nil)
-	if mode == modeDownloadFirst {
-		temporaryPath := filepath.Join(cacheDir, "."+identifier+".ts")
-		m.addLog(identifier, "info", "开始下载分片到临时缓存")
-		err := runFFmpeg(ctx, inputURL, temporaryPath, "mpegts", concurrentDownloads, onProgress, onProcess, onLog)
-		if err == nil {
-			m.setPhase(identifier, "merging")
-			m.addLog(identifier, "info", "分片下载完成，开始合并 MP4")
-			err = runFFmpeg(ctx, temporaryPath, outputPath, "mp4", false, onProgress, onProcess, onLog)
-		}
-		if err == nil && deleteCache {
-			_ = os.Remove(temporaryPath)
-			m.addLog(identifier, "info", "合并成功，已删除临时缓存")
-		}
-		if err != nil {
-			m.finish(identifier, statusFailed, err.Error())
-			return
-		}
-	} else {
-		m.addLog(identifier, "info", "开始边下载边合并")
-		if err := runFFmpeg(ctx, inputURL, outputPath, "mp4", concurrentDownloads, onProgress, onProcess, onLog); err != nil {
-			m.finish(identifier, statusFailed, err.Error())
-			return
+	result, err := downloadHLS(ctx, hlsDownloadConfig{
+		SourceURL:   sourceURL,
+		Referer:     referer,
+		Cookie:      cookie,
+		UserAgent:   userAgent,
+		CacheDir:    cacheDir,
+		CacheKey:    resumeKey,
+		WorkerCount: workerCount,
+	}, hlsDownloadCallbacks{
+		OnLog:      onLog,
+		OnProgress: onProgress,
+		WaitForResume: func(waitContext context.Context) error {
+			return m.waitForResume(waitContext, identifier)
+		},
+	})
+	if err != nil {
+		m.finish(identifier, statusFailed, err.Error())
+		return
+	}
+	if err := m.waitForResume(ctx, identifier); err != nil {
+		m.finish(identifier, statusFailed, "任务已取消")
+		return
+	}
+	m.setPhase(identifier, "merging")
+	m.addLog(identifier, "info", "分片下载完成，开始由 FFmpeg 合并 MP4")
+	if err := runFFmpeg(ctx, result.PlaylistPath, outputPath, "mp4", false, func(seconds float64) {
+		m.setMergeProgress(identifier, seconds)
+	}, onProcess, onLog); err != nil {
+		m.finish(identifier, statusFailed, err.Error())
+		return
+	}
+	if deleteCache {
+		if err := os.RemoveAll(result.CachePath); err != nil {
+			m.addLog(identifier, "warning", "合并成功，但删除任务缓存失败")
+		} else {
+			m.addLog(identifier, "info", "合并成功，已删除任务缓存")
 		}
 	}
 	m.finish(identifier, statusCompleted, "")
-}
-
-func phaseForMode(mode string) string {
-	if mode == modeDownloadFirst {
-		return "downloading"
-	}
-	return "streaming"
 }
 
 func (m *taskManager) setPhase(identifier, phase string) {
@@ -209,6 +209,50 @@ func (m *taskManager) setProcess(identifier string, process *os.Process) {
 		return
 	}
 	m.processes[identifier] = process
+}
+
+func (m *taskManager) setDownloadProgress(identifier string, completedSegments, totalSegments int, downloadedBytes int64, completedSeconds, totalSeconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current := m.tasks[identifier]; current != nil {
+		current.CompletedSegments = completedSegments
+		current.TotalSegments = totalSegments
+		current.DownloadedBytes = downloadedBytes
+		current.ProgressSec = completedSeconds
+		if totalSeconds > current.DurationSec {
+			current.DurationSec = totalSeconds
+		}
+	}
+}
+
+func (m *taskManager) setMergeProgress(identifier string, seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current := m.tasks[identifier]; current != nil {
+		current.ProgressSec = seconds
+	}
+}
+
+func (m *taskManager) waitForResume(ctx context.Context, identifier string) error {
+	for {
+		m.mu.RLock()
+		current := m.tasks[identifier]
+		paused := current != nil && current.Status == statusPaused
+		m.mu.RUnlock()
+		if current == nil {
+			return errors.New("任务不存在")
+		}
+		if !paused {
+			return nil
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (m *taskManager) playlistProxyURL(identifier string) string {
@@ -286,7 +330,17 @@ func (m *taskManager) cancel(identifier string) bool {
 func (m *taskManager) pause(identifier string) bool {
 	m.mu.Lock()
 	current, process := m.tasks[identifier], m.processes[identifier]
-	if current == nil || current.Status != statusRunning || process == nil {
+	if current == nil || current.Status != statusRunning {
+		m.mu.Unlock()
+		return false
+	}
+	if current.Phase == "downloading" {
+		current.Status = statusPaused
+		appendTaskLog(current, "info", "任务已暂停，当前分片完成后将停止继续下载")
+		m.mu.Unlock()
+		return true
+	}
+	if process == nil {
 		m.mu.Unlock()
 		return false
 	}
@@ -307,7 +361,17 @@ func (m *taskManager) pause(identifier string) bool {
 func (m *taskManager) resume(identifier string) bool {
 	m.mu.Lock()
 	current, process := m.tasks[identifier], m.processes[identifier]
-	if current == nil || current.Status != statusPaused || process == nil {
+	if current == nil || current.Status != statusPaused {
+		m.mu.Unlock()
+		return false
+	}
+	if current.Phase == "downloading" {
+		current.Status = statusRunning
+		appendTaskLog(current, "info", "任务已继续，正在派发剩余分片")
+		m.mu.Unlock()
+		return true
+	}
+	if process == nil {
 		m.mu.Unlock()
 		return false
 	}

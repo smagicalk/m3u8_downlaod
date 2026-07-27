@@ -71,14 +71,25 @@ func normalizeUserAgent(raw string) string {
 
 func normalizeMode(raw string) string {
 	mode := strings.TrimSpace(raw)
-	if mode == "" {
-		return modeStream
+	if mode == "" || mode == modeStream {
+		return modeDownloadFirst
 	}
 	return mode
 }
 
-func normalizeConcurrentDownloads(raw *bool) bool {
-	return raw == nil || *raw
+func normalizeWorkerCount(workerCount *int, legacyConcurrentDownloads *bool) (int, error) {
+	if workerCount == nil {
+		if legacyConcurrentDownloads != nil && !*legacyConcurrentDownloads {
+			return 1, nil
+		}
+		return 8, nil
+	}
+	switch *workerCount {
+	case 1, 4, 8, 16:
+		return *workerCount, nil
+	default:
+		return 0, errors.New("并发下载数仅支持 1、4、8 或 16")
+	}
 }
 
 func resolveDirectory(raw, fallback string) (string, error) {

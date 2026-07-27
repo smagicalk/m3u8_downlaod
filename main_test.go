@@ -67,7 +67,7 @@ func TestNormalizeUserAgent(t *testing.T) {
 }
 
 func TestModeAndPlaylistDuration(t *testing.T) {
-	if normalizeMode("") != modeStream || normalizeMode(modeDownloadFirst) != modeDownloadFirst {
+	if normalizeMode("") != modeDownloadFirst || normalizeMode(modeStream) != modeDownloadFirst {
 		t.Fatal("download mode normalization failed")
 	}
 	if err := validateMode("unsupported"); err == nil {
@@ -79,23 +79,31 @@ func TestModeAndPlaylistDuration(t *testing.T) {
 	}
 }
 
-func TestNormalizeConcurrentDownloads(t *testing.T) {
-	if !normalizeConcurrentDownloads(nil) {
-		t.Fatal("missing concurrent download option must default to enabled")
+func TestNormalizeWorkerCount(t *testing.T) {
+	if got, err := normalizeWorkerCount(nil, nil); err != nil || got != 8 {
+		t.Fatalf("default worker count = %d, %v; want 8", got, err)
 	}
 	disabled := false
-	if normalizeConcurrentDownloads(&disabled) {
-		t.Fatal("explicitly disabled concurrent download option must remain disabled")
+	if got, err := normalizeWorkerCount(nil, &disabled); err != nil || got != 1 {
+		t.Fatalf("legacy disabled worker count = %d, %v; want 1", got, err)
+	}
+	workers := 16
+	if got, err := normalizeWorkerCount(&workers, nil); err != nil || got != 16 {
+		t.Fatalf("worker count = %d, %v; want 16", got, err)
+	}
+	invalid := 2
+	if _, err := normalizeWorkerCount(&invalid, nil); err == nil {
+		t.Fatal("unsupported worker count must be rejected")
 	}
 }
 
-func TestConcurrentDownloadsDefaultsToEnabledForAPIPayload(t *testing.T) {
+func TestWorkerCountDefaultsForAPIPayload(t *testing.T) {
 	var payload createRequest
 	if err := json.Unmarshal([]byte(`{"sourceUrl":"https://example.com/video.m3u8"}`), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if !normalizeConcurrentDownloads(payload.ConcurrentDownloads) {
-		t.Fatal("API payload without concurrentDownloads must default to enabled")
+	if got, err := normalizeWorkerCount(payload.WorkerCount, payload.ConcurrentDownloads); err != nil || got != 8 {
+		t.Fatalf("API payload default worker count = %d, %v; want 8", got, err)
 	}
 }
 
@@ -200,6 +208,23 @@ func TestCancelledTaskCannotRestart(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Fatal("the existing context must not be cancelled by a stale runner")
+	}
+}
+
+func TestGoDownloadTaskCanPauseAndResumeWithoutFFmpegProcess(t *testing.T) {
+	manager := newTaskManager(t.TempDir())
+	manager.tasks["test"] = &task{ID: "test", Status: statusRunning, Phase: "downloading"}
+	if !manager.pause("test") {
+		t.Fatal("Go download task must pause without an FFmpeg process")
+	}
+	if status := manager.snapshot("test").Status; status != statusPaused {
+		t.Fatalf("paused status = %q, want %q", status, statusPaused)
+	}
+	if !manager.resume("test") {
+		t.Fatal("Go download task must resume without an FFmpeg process")
+	}
+	if status := manager.snapshot("test").Status; status != statusRunning {
+		t.Fatalf("resumed status = %q, want %q", status, statusRunning)
 	}
 }
 

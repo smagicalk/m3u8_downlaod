@@ -94,13 +94,6 @@
           <input id="output-name" name="outputName" type="text" placeholder="video.mp4">
         </div>
         <div class="field">
-          <label for="download-mode">处理方式</label>
-          <select id="download-mode" name="mode">
-            <option value="stream">边下边合并</option>
-            <option value="download-first">先下载后合并</option>
-          </select>
-        </div>
-        <div class="field">
           <label for="output-directory">保存目录</label>
           <div class="directory-picker"><input id="output-directory" name="outputDirectory" type="text" value="downloads"><button class="directory-select" type="button" data-directory-input="output-directory" aria-label="选择保存目录" title="选择保存目录">&#128193;</button></div>
         </div>
@@ -113,8 +106,13 @@
           <label class="check" for="delete-cache"><input id="delete-cache" name="deleteCache" type="checkbox" checked> 合并成功后删除缓存</label>
         </div>
         <div class="field check-field">
-          <label>网络连接</label>
-          <label class="check" for="concurrent-downloads"><input id="concurrent-downloads" name="concurrentDownloads" type="checkbox" checked> 多连接下载 HLS 分片</label>
+          <label for="worker-count">分片并发数</label>
+          <select id="worker-count" name="workerCount">
+            <option value="1">1</option>
+            <option value="4">4</option>
+            <option value="8" selected>8</option>
+            <option value="16">16</option>
+          </select>
         </div>
       </div>
     </form>
@@ -131,17 +129,16 @@
     const refererInput = document.querySelector('#referer');
     const cookieInput = document.querySelector('#cookie');
     const outputInput = document.querySelector('#output-name');
-    const modeInput = document.querySelector('#download-mode');
     const outputDirectoryInput = document.querySelector('#output-directory');
     const cacheDirectoryInput = document.querySelector('#cache-directory');
     const deleteCacheInput = document.querySelector('#delete-cache');
-    const concurrentDownloadsInput = document.querySelector('#concurrent-downloads');
+    const workerCountInput = document.querySelector('#worker-count');
     const submit = document.querySelector('#submit');
     const notice = document.querySelector('#notice');
     const tasks = document.querySelector('#tasks');
     const health = document.querySelector('#health');
     const labels = { queued: '等待中', running: '下载中', completed: '已完成', failed: '失败', cancelled: '已取消' };
-    const phaseLabels = { streaming: '边下边合并', downloading: '下载中', merging: '合并中' };
+    const phaseLabels = { downloading: '下载分片', merging: '合并中' };
 
     function escapeHTML(value) {
       const element = document.createElement('span');
@@ -158,9 +155,19 @@
     }
 
     function formatProgress(item) {
+      if (item.phase === 'downloading' && item.totalSegments) {
+        return `下载分片 ${item.completedSegments} / ${item.totalSegments} · ${formatBytes(item.downloadedBytes)}`;
+      }
       if (!item.progressSec) return item.phase ? phaseLabels[item.phase] : '等待进度';
       const total = item.durationSec ? ` / ${formatTime(item.durationSec)}` : '';
       return `${phaseLabels[item.phase] || '已处理'} ${formatTime(item.progressSec)}${total}`;
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+      return `${(bytes / (1024 ** index)).toFixed(index ? 1 : 0)} ${units[index]}`;
     }
 
     function formatLogTime(value) {
@@ -185,7 +192,7 @@
       tasks.innerHTML = items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).map((item) => {
         const download = item.status === 'completed' ? ` · <a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
         const error = item.error ? ` · ${escapeHTML(item.error)}` : '';
-        const percent = item.durationSec ? Math.min(100, Math.max(0, item.progressSec / item.durationSec * 100)) : 0;
+        const percent = item.phase === 'downloading' && item.totalSegments ? Math.min(100, Math.max(0, item.completedSegments / item.totalSegments * 100)) : item.durationSec ? Math.min(100, Math.max(0, item.progressSec / item.durationSec * 100)) : 0;
         const pause = item.status === 'running' ? `<button class="action" type="button" data-action="pause" data-id="${item.id}">暂停</button>` : '';
         const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
         const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
@@ -222,7 +229,7 @@
       notice.textContent = '';
       submit.disabled = true;
       try {
-        await request('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceUrl: sourceInput.value, referer: refererInput.value, cookie: cookieInput.value, userAgent: userAgentInput.value, mode: modeInput.value, outputName: outputInput.value, outputDirectory: outputDirectoryInput.value, cacheDirectory: cacheDirectoryInput.value, deleteCache: deleteCacheInput.checked, concurrentDownloads: concurrentDownloadsInput.checked }) });
+        await request('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceUrl: sourceInput.value, referer: refererInput.value, cookie: cookieInput.value, userAgent: userAgentInput.value, outputName: outputInput.value, outputDirectory: outputDirectoryInput.value, cacheDirectory: cacheDirectoryInput.value, deleteCache: deleteCacheInput.checked, workerCount: Number(workerCountInput.value) }) });
         outputInput.value = '';
         await refresh();
       } catch (error) { notice.textContent = error.message; }
