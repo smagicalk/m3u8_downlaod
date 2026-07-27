@@ -34,4 +34,5 @@ go.work.sum
 # Local downloader data
 downloads/
 cache/
+data/
 session.md

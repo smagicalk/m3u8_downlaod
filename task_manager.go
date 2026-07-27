@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,15 +22,80 @@ type taskManager struct {
 	outputDir    string
 	proxyBaseURL string
 	httpClient   *http.Client
+	store        *store
+	defaults     appSettings
 }
 
 func newTaskManager(outputDir string) *taskManager {
+	defaults, err := defaultSettings()
+	if err == nil {
+		defaults.OutputDir = outputDir
+	}
+	return newTaskManagerWithStore(defaults, nil)
+}
+
+func newTaskManagerWithStore(defaults appSettings, storage *store) *taskManager {
 	return &taskManager{
 		tasks:      make(map[string]*task),
 		cancels:    make(map[string]context.CancelFunc),
 		processes:  make(map[string]*os.Process),
-		outputDir:  outputDir,
+		outputDir:  defaults.OutputDir,
 		httpClient: http.DefaultClient,
+		store:      storage,
+		defaults:   defaults,
+	}
+}
+
+func (m *taskManager) settings() appSettings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.defaults
+}
+
+func (m *taskManager) updateSettings(next appSettings) error {
+	outputDir, err := resolveDirectory(next.OutputDir, m.defaults.OutputDir)
+	if err != nil {
+		return err
+	}
+	cacheDir, err := resolveDirectory(next.CacheDir, m.defaults.CacheDir)
+	if err != nil {
+		return err
+	}
+	if err := validateWorkerCount(next.WorkerCount); err != nil {
+		return err
+	}
+	next.OutputDir, next.CacheDir = outputDir, cacheDir
+	if err := os.MkdirAll(next.OutputDir, 0o755); err != nil {
+		return fmt.Errorf("创建默认保存目录失败: %w", err)
+	}
+	if err := os.MkdirAll(next.CacheDir, 0o755); err != nil {
+		return fmt.Errorf("创建默认缓存目录失败: %w", err)
+	}
+	if m.store != nil {
+		if err := m.store.saveSettings(next); err != nil {
+			return fmt.Errorf("保存默认设置失败: %w", err)
+		}
+	}
+	m.mu.Lock()
+	m.defaults, m.outputDir = next, next.OutputDir
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *taskManager) restore(items []*task) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, current := range items {
+		if current.Status == statusQueued || current.Status == statusRunning || current.Status == statusPaused {
+			current.Status = statusFailed
+			current.Error = "服务重启，任务已中断"
+			finished := time.Now()
+			current.FinishedAt = &finished
+			appendTaskLog(current, "warning", current.Error)
+			m.persistTaskLocked(current)
+			m.persistLogLocked(current)
+		}
+		m.tasks[current.ID] = current
 	}
 }
 
@@ -56,14 +122,15 @@ func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, output
 	if err != nil {
 		return nil, err
 	}
-	resolvedOutputDir, err := resolveDirectory(outputDir, m.outputDir)
+	defaults := m.settings()
+	resolvedOutputDir, err := resolveDirectory(outputDir, defaults.OutputDir)
 	if err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(resolvedOutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建下载目录失败: %w", err)
 	}
-	resolvedCacheDir, err := resolveDirectory(cacheDir, defaultCacheDir)
+	resolvedCacheDir, err := resolveDirectory(cacheDir, defaults.CacheDir)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +164,8 @@ func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, output
 	m.mu.Lock()
 	appendTaskLog(created, "info", "任务已创建，等待开始")
 	m.tasks[identifier] = created
+	m.persistTaskLocked(created)
+	m.persistLogLocked(created)
 	m.mu.Unlock()
 
 	go m.run(identifier)
@@ -119,6 +188,7 @@ func (m *taskManager) run(identifier string) {
 		current.Status = statusRunning
 		current.StartedAt = &started
 	}
+	m.persistTaskLocked(current)
 	m.mu.Unlock()
 	defer func() {
 		cancel()
@@ -198,6 +268,7 @@ func (m *taskManager) setPhase(identifier, phase string) {
 	if current := m.tasks[identifier]; current != nil && current.Status != statusCancelled {
 		current.Status = statusRunning
 		current.Phase = phase
+		m.persistTaskLocked(current)
 	}
 }
 
@@ -222,6 +293,7 @@ func (m *taskManager) setDownloadProgress(identifier string, completedSegments, 
 		if totalSeconds > current.DurationSec {
 			current.DurationSec = totalSeconds
 		}
+		m.persistTaskLocked(current)
 	}
 }
 
@@ -230,6 +302,7 @@ func (m *taskManager) setMergeProgress(identifier string, seconds float64) {
 	defer m.mu.Unlock()
 	if current := m.tasks[identifier]; current != nil {
 		current.ProgressSec = seconds
+		m.persistTaskLocked(current)
 	}
 }
 
@@ -280,6 +353,8 @@ func (m *taskManager) finish(identifier string, status taskStatus, message strin
 		} else if message != "" {
 			appendTaskLog(current, "error", message)
 		}
+		m.persistTaskLocked(current)
+		m.persistLogLocked(current)
 	}
 }
 
@@ -321,6 +396,8 @@ func (m *taskManager) cancel(identifier string) bool {
 	finished := time.Now()
 	current.FinishedAt = &finished
 	appendTaskLog(current, "warning", "任务已取消")
+	m.persistTaskLocked(current)
+	m.persistLogLocked(current)
 	if cancel := m.cancels[identifier]; cancel != nil {
 		cancel()
 	}
@@ -337,6 +414,8 @@ func (m *taskManager) pause(identifier string) bool {
 	if current.Phase == "downloading" {
 		current.Status = statusPaused
 		appendTaskLog(current, "info", "任务已暂停，当前分片完成后将停止继续下载")
+		m.persistTaskLocked(current)
+		m.persistLogLocked(current)
 		m.mu.Unlock()
 		return true
 	}
@@ -353,6 +432,8 @@ func (m *taskManager) pause(identifier string) bool {
 	if current := m.tasks[identifier]; current != nil && current.Status == statusRunning {
 		current.Status = statusPaused
 		appendTaskLog(current, "info", "任务已暂停")
+		m.persistTaskLocked(current)
+		m.persistLogLocked(current)
 		return true
 	}
 	return false
@@ -368,6 +449,8 @@ func (m *taskManager) resume(identifier string) bool {
 	if current.Phase == "downloading" {
 		current.Status = statusRunning
 		appendTaskLog(current, "info", "任务已继续，正在派发剩余分片")
+		m.persistTaskLocked(current)
+		m.persistLogLocked(current)
 		m.mu.Unlock()
 		return true
 	}
@@ -384,7 +467,27 @@ func (m *taskManager) resume(identifier string) bool {
 	if current := m.tasks[identifier]; current != nil && current.Status == statusPaused {
 		current.Status = statusRunning
 		appendTaskLog(current, "info", "任务已继续")
+		m.persistTaskLocked(current)
+		m.persistLogLocked(current)
 		return true
 	}
 	return false
+}
+
+func (m *taskManager) persistTaskLocked(current *task) {
+	if m.store == nil {
+		return
+	}
+	if err := m.store.saveTask(current); err != nil {
+		log.Printf("保存任务 %s 失败: %v", current.ID, err)
+	}
+}
+
+func (m *taskManager) persistLogLocked(current *task) {
+	if m.store == nil || len(current.Logs) == 0 {
+		return
+	}
+	if err := m.store.saveTaskLog(current.ID, current.LogSequence, current.Logs[len(current.Logs)-1]); err != nil {
+		log.Printf("保存任务日志 %s 失败: %v", current.ID, err)
+	}
 }

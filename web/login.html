@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 - M3U8 下载器</title>
+  <style>
+    :root { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; background: #f4f7f9; color: #16222a; } * { box-sizing: border-box; } body { margin: 0; min-width: 320px; } main { width: min(100% - 32px, 420px); margin: 0 auto; padding: 13vh 0; } h1 { margin: 0 0 8px; font-size: 28px; } p { margin: 0; color: #52636b; } form { display: grid; gap: 16px; margin-top: 30px; padding-top: 22px; border-top: 2px solid #16222a; } label { color: #52636b; font-size: 13px; font-weight: 650; } .field { display: grid; gap: 6px; } input, button { min-height: 44px; border-radius: 6px; font: inherit; } input { width: 100%; border: 1px solid #9eafb8; padding: 0 12px; } input:focus { border-color: #087f5b; outline: 3px solid #bfe8da; } button { border: 0; background: #087f5b; color: #fff; font-weight: 650; cursor: pointer; } button:hover { background: #056b4c; } button:disabled { background: #9eafb8; } #notice { min-height: 20px; margin: 0; color: #b42318; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>M3U8 下载器</h1>
+    <p>登录后管理下载任务和默认设置</p>
+    <form id="login-form">
+      <div class="field"><label for="username">用户名</label><input id="username" value="admin" autocomplete="username" required></div>
+      <div class="field"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" required autofocus></div>
+      <p id="notice" role="alert"></p>
+      <button id="submit" type="submit">登录</button>
+    </form>
+  </main>
+  <script>
+    const form = document.querySelector('#login-form'); const username = document.querySelector('#username'); const password = document.querySelector('#password'); const notice = document.querySelector('#notice'); const submit = document.querySelector('#submit');
+    form.addEventListener('submit', async (event) => { event.preventDefault(); notice.textContent = ''; submit.disabled = true; try { const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: username.value, password: password.value }) }); const body = await response.json(); if (!response.ok) throw new Error(body.error || '登录失败'); window.location.assign('/'); } catch (error) { notice.textContent = error.message; } finally { submit.disabled = false; } });
+  </script>
+</body>
+</html>

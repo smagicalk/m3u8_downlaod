@@ -18,6 +18,7 @@ func (m *taskManager) addLog(identifier, level, message string) {
 	defer m.mu.Unlock()
 	if current := m.tasks[identifier]; current != nil {
 		appendTaskLog(current, level, message)
+		m.persistLogLocked(current)
 	}
 }
 
@@ -31,6 +32,7 @@ func appendTaskLog(current *task, level, message string) {
 		Level:   level,
 		Message: message,
 	})
+	current.LogSequence++
 	if len(current.Logs) > maxTaskLogEntries {
 		current.Logs = append([]taskLog(nil), current.Logs[len(current.Logs)-maxTaskLogEntries:]...)
 	}

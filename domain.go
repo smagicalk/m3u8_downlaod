@@ -40,6 +40,7 @@ type task struct {
 	ProgressSec       float64    `json:"progressSec"`
 	DurationSec       float64    `json:"durationSec"`
 	Logs              []taskLog  `json:"logs"`
+	LogSequence       int        `json:"-"`
 	CreatedAt         time.Time  `json:"createdAt"`
 	StartedAt         *time.Time `json:"startedAt,omitempty"`
 	FinishedAt        *time.Time `json:"finishedAt,omitempty"`
@@ -54,10 +55,20 @@ type createRequest struct {
 	Mode                string `json:"mode"`
 	OutputDir           string `json:"outputDirectory"`
 	CacheDir            string `json:"cacheDirectory"`
-	DeleteCache         bool   `json:"deleteCache"`
+	DeleteCache         *bool  `json:"deleteCache"`
 	ConcurrentDownloads *bool  `json:"concurrentDownloads"`
 	WorkerCount         *int   `json:"workerCount"`
 	OutputName          string `json:"outputName"`
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
 }
 
 type directorySelectionRequest struct {

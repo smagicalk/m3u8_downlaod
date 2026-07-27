@@ -11,6 +11,7 @@
     main { width: min(980px, calc(100% - 32px)); margin: 0 auto; padding: 52px 0 72px; }
     header { display: flex; align-items: end; justify-content: space-between; gap: 24px; border-bottom: 1px solid #cdd8dd; padding-bottom: 20px; }
     h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: 0; }
+    .header-actions { display: flex; align-items: center; gap: 12px; }
     .health { color: #52636b; font-size: 14px; white-space: nowrap; }
     .health.ready { color: #087f5b; }
     .health.missing { color: #b54708; }
@@ -33,6 +34,12 @@
     button:hover { background: #056b4c; }
     button:disabled { background: #9eafb8; cursor: not-allowed; }
     .notice { min-height: 22px; margin: -24px 0 24px; color: #b42318; font-size: 14px; }
+    .settings-section { margin-bottom: 36px; }
+    .settings-section form { margin: 0; }
+    .settings-actions { display: flex; justify-content: end; margin-top: 14px; }
+    .header-link, .logout { min-height: 34px; padding: 0 10px; border: 1px solid #9eafb8; border-radius: 6px; background: transparent; color: #34434a; font-size: 13px; font-weight: 650; text-decoration: none; }
+    .header-link { display: inline-flex; align-items: center; }
+    .header-link:hover, .logout:hover { background: #e5ecef; color: #16222a; }
     section { border-top: 2px solid #16222a; }
     h2 { margin: 18px 0 12px; font-size: 16px; }
     .empty { color: #667780; padding: 26px 0; border-top: 1px solid #dbe3e7; }
@@ -67,14 +74,14 @@
     .cancel { color: #b42318; border-color: #d6a5a0; }
     .cancel:hover { background: #fde4e1; }
     a { color: #056b4c; }
-    @media (max-width: 720px) { main { width: min(100% - 24px, 980px); padding-top: 28px; } header { align-items: start; flex-direction: column; gap: 8px; } .primary-row, .request-grid, .detail-meta { grid-template-columns: 1fr; } .field-wide { grid-column: auto; } .task { grid-template-columns: 1fr; gap: 10px; } .state { justify-content: space-between; } .log-output { height: 300px; } }
+    @media (max-width: 720px) { main { width: min(100% - 24px, 980px); padding-top: 28px; } header { align-items: start; flex-direction: column; gap: 8px; } .primary-row, .request-grid, .detail-meta { grid-template-columns: 1fr; } .field-wide { grid-column: auto; } .task { grid-template-columns: 1fr; gap: 10px; } .state { justify-content: space-between; } .header-actions { flex-wrap: wrap; } .log-output { height: 300px; } }
   </style>
 </head>
 <body>
   <main>
     <header>
       <h1>M3U8 下载器</h1>
-      <span id="health" class="health">正在检查 FFmpeg</span>
+      <div class="header-actions"><span id="health" class="health">正在检查 FFmpeg</span><a class="header-link" href="/password">修改密码</a><button id="logout" class="logout" type="button">退出</button></div>
     </header>
     <form id="task-form">
       <div class="primary-row">
@@ -125,6 +132,18 @@
       </div>
     </form>
     <p id="notice" class="notice" role="alert"></p>
+    <section class="settings-section" aria-labelledby="settings-heading">
+      <h2 id="settings-heading">默认设置</h2>
+      <form id="settings-form">
+        <div class="request-grid">
+          <div class="field"><label for="default-output-directory">默认保存目录</label><div class="directory-picker"><input id="default-output-directory" type="text"><button class="directory-select" type="button" data-directory-input="default-output-directory" aria-label="选择默认保存目录" title="选择默认保存目录">&#128193;</button></div></div>
+          <div class="field"><label for="default-cache-directory">默认缓存目录</label><div class="directory-picker"><input id="default-cache-directory" type="text"><button class="directory-select" type="button" data-directory-input="default-cache-directory" aria-label="选择默认缓存目录" title="选择默认缓存目录">&#128193;</button></div></div>
+          <div class="field check-field"><label>默认缓存处理</label><label class="check" for="default-delete-cache"><input id="default-delete-cache" type="checkbox"> 合并成功后删除缓存</label></div>
+          <div class="field check-field"><label for="default-worker-count">默认分片并发数</label><select id="default-worker-count"><option value="1">1</option><option value="4">4</option><option value="8">8</option><option value="16">16</option></select></div>
+        </div>
+        <div class="settings-actions"><button id="save-settings" type="submit">保存默认设置</button></div>
+      </form>
+    </section>
     <section id="tasks-section" aria-labelledby="tasks-heading">
       <h2 id="tasks-heading">任务</h2>
       <div id="tasks" class="empty">暂无任务</div>
@@ -133,6 +152,7 @@
   </main>
   <script>
     const form = document.querySelector('#task-form');
+    const settingsForm = document.querySelector('#settings-form');
     const sourceInput = document.querySelector('#source-url');
     const userAgentInput = document.querySelector('#user-agent');
     const refererInput = document.querySelector('#referer');
@@ -148,6 +168,12 @@
     const tasksSection = document.querySelector('#tasks-section');
     const taskDetail = document.querySelector('#task-detail');
     const health = document.querySelector('#health');
+    const logout = document.querySelector('#logout');
+    const defaultOutputDirectoryInput = document.querySelector('#default-output-directory');
+    const defaultCacheDirectoryInput = document.querySelector('#default-cache-directory');
+    const defaultDeleteCacheInput = document.querySelector('#default-delete-cache');
+    const defaultWorkerCountInput = document.querySelector('#default-worker-count');
+    const saveSettings = document.querySelector('#save-settings');
     const labels = { queued: '等待中', running: '下载中', completed: '已完成', failed: '失败', cancelled: '已取消' };
     const phaseLabels = { downloading: '下载分片', merging: '合并中' };
     let selectedTaskID = null;
@@ -257,6 +283,20 @@
       } catch { health.textContent = '服务状态未知'; }
     }
 
+    async function loadSettings() {
+      try {
+        const settings = await request('/api/settings/defaults');
+        outputDirectoryInput.value = settings.outputDirectory;
+        cacheDirectoryInput.value = settings.cacheDirectory;
+        deleteCacheInput.checked = settings.deleteCache;
+        workerCountInput.value = String(settings.workerCount);
+        defaultOutputDirectoryInput.value = settings.outputDirectory;
+        defaultCacheDirectoryInput.value = settings.cacheDirectory;
+        defaultDeleteCacheInput.checked = settings.deleteCache;
+        defaultWorkerCountInput.value = String(settings.workerCount);
+      } catch (error) { notice.textContent = error.message; }
+    }
+
     async function chooseDirectory(input, button) {
       button.disabled = true;
       notice.textContent = '';
@@ -279,11 +319,30 @@
       finally { submit.disabled = false; }
     });
 
-    form.addEventListener('click', (event) => {
+    document.addEventListener('click', (event) => {
       const button = event.target.closest('[data-directory-input]');
       if (!button) return;
       const input = document.querySelector(`#${button.dataset.directoryInput}`);
       if (input) chooseDirectory(input, button);
+    });
+
+    settingsForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      notice.textContent = '';
+      saveSettings.disabled = true;
+      try {
+        const settings = await request('/api/settings/defaults', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ outputDirectory: defaultOutputDirectoryInput.value, cacheDirectory: defaultCacheDirectoryInput.value, deleteCache: defaultDeleteCacheInput.checked, workerCount: Number(defaultWorkerCountInput.value) }) });
+        outputDirectoryInput.value = settings.outputDirectory;
+        cacheDirectoryInput.value = settings.cacheDirectory;
+        deleteCacheInput.checked = settings.deleteCache;
+        workerCountInput.value = String(settings.workerCount);
+        notice.textContent = '默认设置已保存';
+      } catch (error) { notice.textContent = error.message; }
+      finally { saveSettings.disabled = false; }
+    });
+
+    logout.addEventListener('click', async () => {
+      try { await request('/api/auth/logout', { method: 'POST' }); } finally { window.location.assign('/login'); }
     });
 
     tasks.addEventListener('click', async (event) => {
@@ -316,6 +375,7 @@
     });
 
     checkHealth();
+    loadSettings();
     refresh();
     setInterval(refresh, 1000);
   </script>
