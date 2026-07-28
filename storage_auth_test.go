@@ -109,3 +109,20 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 		t.Fatalf("new password status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
 }
+
+func TestResetAdminPassword(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	if err := storage.resetAdminPassword("ResetPass123"); err != nil {
+		t.Fatal(err)
+	}
+	if storage.verifyPassword(adminUsername, "InitialPass123") {
+		t.Fatal("old password must no longer authenticate")
+	}
+	if !storage.verifyPassword(adminUsername, "ResetPass123") {
+		t.Fatal("reset password must authenticate")
+	}
+}

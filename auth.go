@@ -83,6 +83,28 @@ func (s *store) changePassword(username, currentPassword, nextPassword string) e
 	return err
 }
 
+func (s *store) resetAdminPassword(nextPassword string) error {
+	if err := validatePassword(nextPassword); err != nil {
+		return err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(nextPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.Exec(`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`, hash, time.Now().UnixMilli(), adminUsername)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errors.New("未找到管理员账号")
+	}
+	return nil
+}
+
 func validatePassword(password string) error {
 	if len(password) < 8 || len(password) > 128 {
 		return errors.New("密码长度必须为 8 至 128 个字符")

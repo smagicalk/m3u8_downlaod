@@ -16,8 +16,16 @@ import (
 var webFiles embed.FS
 
 func main() {
+	var resetPassword bool
 	flag.StringVar(&ffmpegPathOverride, "ffmpeg-path", "", "FFmpeg executable path")
+	flag.BoolVar(&resetPassword, "reset-password", false, "Interactively reset the local admin password")
 	flag.Parse()
+	if resetPassword {
+		if err := runPasswordReset(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	address := strings.TrimSpace(os.Getenv("ADDR"))
 	if address == "" {

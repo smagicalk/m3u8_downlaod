@@ -49,6 +49,12 @@ go run . -ffmpeg-path H:/video/ffmpeg.exe
 
 SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会将默认保存目录、缓存目录、缓存清理策略和分片并发数写入数据库，可在主页“默认设置”中修改。
 
+忘记管理员密码时，先停止正在运行的服务，再在运行程序的本机交互式终端执行以下命令。该命令会隐藏密码输入、要求重复确认，并且只重置本地 `admin` 账号，不启动 Web 服务：
+
+```powershell
+.\m3u8-downloader.exe -reset-password
+```
+
 ## Telegram Bot
 
 需要先启动官方本地 Bot API Server，并启用 `--local`：
