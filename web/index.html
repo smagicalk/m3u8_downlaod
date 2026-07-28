@@ -36,6 +36,8 @@
     .notice { min-height: 22px; margin: -24px 0 24px; color: #b42318; font-size: 14px; }
     .settings-section { margin-bottom: 36px; }
     .settings-section form { margin: 0; }
+    .settings-subsection { margin-top: 26px; padding-top: 20px; border-top: 1px solid #dbe3e7; }
+    .settings-subsection h3 { margin: 0 0 12px; font-size: 15px; }
     .settings-actions { display: flex; align-items: center; justify-content: end; gap: 10px; margin-top: 14px; }
     .header-link, .logout { min-height: 34px; padding: 0 10px; border: 1px solid #9eafb8; border-radius: 6px; background: transparent; color: #34434a; font-size: 13px; font-weight: 650; text-decoration: none; }
     .header-link { display: inline-flex; align-items: center; }
@@ -136,7 +138,9 @@
     </form>
     <p id="notice" class="notice" role="alert"></p>
     <section class="settings-section" aria-labelledby="settings-heading">
-      <h2 id="settings-heading">默认设置</h2>
+      <h2 id="settings-heading">设置</h2>
+      <div class="settings-subsection" aria-labelledby="download-settings-heading">
+      <h3 id="download-settings-heading">下载默认值</h3>
       <form id="settings-form">
         <div class="request-grid">
           <div class="field"><label for="default-output-directory">默认保存目录</label><div class="directory-picker"><input id="default-output-directory" type="text"><button class="directory-select" type="button" data-directory-input="default-output-directory" aria-label="选择默认保存目录" title="选择默认保存目录">&#128193;</button></div></div>
@@ -146,9 +150,9 @@
         </div>
         <div class="settings-actions"><button id="save-settings" type="submit">保存默认设置</button></div>
       </form>
-    </section>
-    <section class="settings-section" aria-labelledby="telegram-heading">
-      <h2 id="telegram-heading">Telegram Bot</h2>
+      </div>
+      <div class="settings-subsection" aria-labelledby="telegram-heading">
+      <h3 id="telegram-heading">Telegram Bot</h3>
       <form id="telegram-form">
         <div class="request-grid">
           <div class="field"><label for="telegram-api-base-url">本地 Bot API Server 地址</label><input id="telegram-api-base-url" type="url" value="http://127.0.0.1:8081" required></div>
@@ -159,6 +163,7 @@
         </div>
         <div class="settings-actions"><span id="telegram-state" class="telegram-state"></span><button id="unbind-telegram" class="secondary-button" type="button">解除绑定</button><button id="test-telegram" class="secondary-button" type="button">测试连接</button><button id="save-telegram" type="submit">保存 Bot 绑定</button></div>
       </form>
+      </div>
     </section>
     <section id="tasks-section" aria-labelledby="tasks-heading">
       <h2 id="tasks-heading">任务</h2>
