@@ -50,9 +50,10 @@ type telegramConfigResponse struct {
 }
 
 type telegramService struct {
-	manager *taskManager
-	store   *store
-	client  *http.Client
+	manager      *taskManager
+	store        *store
+	client       *http.Client
+	uploadClient *http.Client
 
 	mu          sync.RWMutex
 	settings    telegramSettings
@@ -86,7 +87,7 @@ func newTelegramService(storage *store, manager *taskManager) (*telegramService,
 	if err != nil {
 		return nil, err
 	}
-	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, settings: settings, uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}, nil
+	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, uploadClient: &http.Client{}, settings: settings, uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}, nil
 }
 
 func (s *telegramService) start() {
@@ -693,7 +694,7 @@ func (s *telegramService) sendFile(ctx context.Context, settings telegramSetting
 		_ = writer.Close()
 	}()
 	defer reader.Close()
-	return s.sendTelegramRequest(request, nil)
+	return s.sendTelegramUploadRequest(request, nil)
 }
 
 func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int) error {
@@ -717,7 +718,7 @@ func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramS
 		_ = writer.Close()
 	}()
 	defer reader.Close()
-	return s.sendTelegramRequest(request, nil)
+	return s.sendTelegramUploadRequest(request, nil)
 }
 
 func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader) error {
@@ -782,7 +783,18 @@ func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []s
 }
 
 func (s *telegramService) sendTelegramRequest(request *http.Request, result any) error {
-	response, err := s.client.Do(request)
+	return s.sendTelegramRequestWithClient(s.client, request, result)
+}
+
+func (s *telegramService) sendTelegramUploadRequest(request *http.Request, result any) error {
+	return s.sendTelegramRequestWithClient(s.uploadClient, request, result)
+}
+
+func (s *telegramService) sendTelegramRequestWithClient(client *http.Client, request *http.Request, result any) error {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return errors.New("无法连接本地 Bot API Server")
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestTelegramSettingsParseAndHideToken(t *testing.T) {
@@ -169,6 +170,28 @@ func TestTelegramMediaGroupStreamsDocumentAlbum(t *testing.T) {
 
 	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTelegramMediaGroupDoesNotUsePollTimeout(t *testing.T) {
+	directory := t.TempDir()
+	parts := []string{filepath.Join(directory, "video.part001"), filepath.Join(directory, "video.part002")}
+	for _, path := range parts {
+		if err := os.WriteFile(path, []byte("video-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		time.Sleep(80 * time.Millisecond)
+		_, _ = writer.Write([]byte(`{"ok":true,"result":[]}`))
+	}))
+	defer server.Close()
+	service := &telegramService{client: &http.Client{Timeout: 10 * time.Millisecond}}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+
+	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2); err != nil {
+		t.Fatalf("large upload must not use the poll timeout: %v", err)
 	}
 }
 
