@@ -86,6 +86,13 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 	if allowed.Code != http.StatusOK {
 		t.Fatalf("authorized task status = %d, want %d", allowed.Code, http.StatusOK)
 	}
+	settingsPage := httptest.NewRecorder()
+	settingsRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	settingsRequest.AddCookie(cookie)
+	handler.ServeHTTP(settingsPage, settingsRequest)
+	if settingsPage.Code != http.StatusOK || !bytes.Contains(settingsPage.Body.Bytes(), []byte(`id="telegram-form"`)) {
+		t.Fatalf("settings page = %d, contains Telegram form = %t", settingsPage.Code, bytes.Contains(settingsPage.Body.Bytes(), []byte(`id="telegram-form"`)))
+	}
 
 	changeBody, _ := json.Marshal(changePasswordRequest{CurrentPassword: "InitialPass123", NewPassword: "ChangedPass123"})
 	change := httptest.NewRecorder()

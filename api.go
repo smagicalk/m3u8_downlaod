@@ -82,6 +82,7 @@ func newAPIHandler(manager *taskManager, auth *authService, telegram *telegramSe
 		writeJSON(writer, http.StatusOK, map[string]bool{"ok": true})
 	})
 	protected.HandleFunc("GET /password", serveStaticPage(staticFiles, "/password.html"))
+	protected.HandleFunc("GET /settings", serveStaticPage(staticFiles, "/settings.html"))
 	registerTaskRoutes(protected, manager, telegram)
 	protected.Handle("GET /", staticFiles)
 	public.Handle("/", auth.require(protected))
