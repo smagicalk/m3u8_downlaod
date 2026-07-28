@@ -1,0 +1,78 @@
+name: 构建发布包
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 要构建的分支或 tag
+        required: true
+        default: dev
+        type: string
+      release_tag:
+        description: 要创建或更新的发布 tag，例如 v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建并上传发布包
+    runs-on: windows-latest
+    steps:
+      - name: 检出指定源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: 测试
+        shell: pwsh
+        run: go test ./...
+
+      - name: 构建 Windows 和 Linux 包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -ldflags '-s -w' -o dist/m3u8-downloader-windows-amd64.exe .
+          $env:GOOS = 'linux'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -ldflags '-s -w' -o dist/m3u8-downloader
+          Compress-Archive -Path dist/m3u8-downloader-windows-amd64.exe -DestinationPath dist/m3u8-downloader-windows-amd64.zip -Force
+          Compress-Archive -Path dist/m3u8-downloader -DestinationPath dist/m3u8-downloader-linux-amd64.zip -Force
+          Get-FileHash dist/m3u8-downloader-windows-amd64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-FileHash dist/m3u8-downloader-linux-amd64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Add-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: 上传工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3u8-downloader-${{ inputs.release_tag }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 创建或更新 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $commit = git rev-parse HEAD
+          $assets = @('dist/m3u8-downloader-windows-amd64.zip', 'dist/m3u8-downloader-linux-amd64.zip', 'dist/SHA256SUMS.txt')
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG @assets --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:RELEASE_TAG @assets --target $commit --title $env:RELEASE_TAG --generate-notes --repo $env:GITHUB_REPOSITORY
+          }

@@ -75,3 +75,12 @@ SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会�
 默认服务地址为 `http://127.0.0.1:8081`。登录下载器后，在主页的“Telegram Bot”区域填写 Bot Token、一个或多个目标 Chat ID、自动上传选项和切分大小。多个 Chat ID 以英文逗号分隔；私聊、群组和频道均可作为发送目标。Bot 只处理已绑定 Chat ID 的 `/start`、`/tasks`、`/completed` 和内联按钮操作。
 
 请仅下载你拥有访问和保存权限的媒体内容。
+
+## GitHub 发布
+
+仓库提供两个仅可在 Actions 页面手动运行的工作流：
+
+- “构建发布包”：填写源码分支或 tag 与目标发布 tag。它会测试代码，构建 Windows 和 Linux AMD64 压缩包，上传工作流产物，并创建或更新同名 GitHub Release。
+- “发布 Docker 镜像”：默认读取最新 GitHub Release tag 的 `m3u8-downloader-linux-amd64.zip`，不在镜像构建阶段重新编译。镜像上传至 `ghcr.io/smagicalk/m3u8_downlaod`，同时标记该发布 tag 和 `latest`。
+
+首次推送镜像前，请在仓库 Actions 设置中允许工作流拥有 `Read and write permissions`，并确认 GitHub Packages 对仓库可写。运行容器时持久化挂载 `/app/data`、`/app/downloads` 和 `/app/cache`；容器会监听 `8080` 端口，并已内置 FFmpeg。

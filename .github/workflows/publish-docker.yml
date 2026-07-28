@@ -1,0 +1,57 @@
+name: 发布 Docker 镜像
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 发布 tag；留空时自动使用最新 GitHub Release tag
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: 使用发布包构建并推送镜像
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 Docker 构建定义
+        uses: actions/checkout@v7
+
+      - name: 下载最新 tag 的 Linux 发布包
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ -n "$REQUESTED_TAG" ]; then
+            release_tag="$REQUESTED_TAG"
+          else
+            release_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+          fi
+          test -n "$release_tag"
+          mkdir -p release dist
+          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --pattern 'm3u8-downloader-linux-amd64.zip' --pattern 'SHA256SUMS.txt' --dir release
+          (cd release && sha256sum -c SHA256SUMS.txt)
+          unzip -q release/m3u8-downloader-linux-amd64.zip -d dist
+          chmod 0755 dist/m3u8-downloader
+          image_tag="$(printf '%s' "$release_tag" | tr '/' '-')"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: 构建并推送镜像
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          docker build --pull --tag "$IMAGE:$IMAGE_TAG" --tag "$IMAGE:latest" .
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest"

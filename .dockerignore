@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!dist/
+!dist/m3u8-downloader
