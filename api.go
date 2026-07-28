@@ -7,7 +7,7 @@ import (
 	"os/exec"
 )
 
-func newAPIHandler(manager *taskManager, auth *authService, staticFiles http.Handler) http.Handler {
+func newAPIHandler(manager *taskManager, auth *authService, telegram *telegramService, staticFiles http.Handler) http.Handler {
 	public := http.NewServeMux()
 	protected := http.NewServeMux()
 	public.HandleFunc("GET /login", serveStaticPage(staticFiles, "/login.html"))
@@ -51,14 +51,44 @@ func newAPIHandler(manager *taskManager, auth *authService, staticFiles http.Han
 		}
 		writeJSON(writer, http.StatusOK, manager.settings())
 	})
+	protected.HandleFunc("GET /api/telegram/config", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, telegram.configuration())
+	})
+	protected.HandleFunc("PUT /api/telegram/config", func(writer http.ResponseWriter, request *http.Request) {
+		var payload telegramConfigRequest
+		if err := decodeJSONBody(writer, request, 8*1024, &payload); err != nil {
+			writeError(writer, http.StatusBadRequest, "请求内容无效")
+			return
+		}
+		settings, err := telegram.updateConfiguration(payload)
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, settings)
+	})
+	protected.HandleFunc("DELETE /api/telegram/config", func(writer http.ResponseWriter, request *http.Request) {
+		if err := telegram.unbind(); err != nil {
+			writeError(writer, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, telegram.configuration())
+	})
+	protected.HandleFunc("POST /api/telegram/test", func(writer http.ResponseWriter, request *http.Request) {
+		if err := telegram.testConnection(request.Context()); err != nil {
+			writeError(writer, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]bool{"ok": true})
+	})
 	protected.HandleFunc("GET /password", serveStaticPage(staticFiles, "/password.html"))
-	registerTaskRoutes(protected, manager)
+	registerTaskRoutes(protected, manager, telegram)
 	protected.Handle("GET /", staticFiles)
 	public.Handle("/", auth.require(protected))
 	return securityHeaders(public)
 }
 
-func registerTaskRoutes(mux *http.ServeMux, manager *taskManager) {
+func registerTaskRoutes(mux *http.ServeMux, manager *taskManager, telegram *telegramService) {
 	mux.HandleFunc("POST /api/directories/select", func(writer http.ResponseWriter, request *http.Request) {
 		var payload directorySelectionRequest
 		if err := decodeJSONBody(writer, request, 4*1024, &payload); err != nil {
@@ -125,6 +155,13 @@ func registerTaskRoutes(mux *http.ServeMux, manager *taskManager) {
 			return
 		}
 		writeError(writer, http.StatusConflict, "任务无法继续")
+	})
+	mux.HandleFunc("POST /api/tasks/{id}/telegram-upload", func(writer http.ResponseWriter, request *http.Request) {
+		if err := telegram.queueUpload(request.PathValue("id")); err != nil {
+			writeError(writer, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusAccepted, manager.snapshot(request.PathValue("id")))
 	})
 	mux.HandleFunc("GET /api/tasks/{id}/download", func(writer http.ResponseWriter, request *http.Request) {
 		current := manager.snapshot(request.PathValue("id"))

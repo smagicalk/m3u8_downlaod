@@ -36,10 +36,13 @@
     .notice { min-height: 22px; margin: -24px 0 24px; color: #b42318; font-size: 14px; }
     .settings-section { margin-bottom: 36px; }
     .settings-section form { margin: 0; }
-    .settings-actions { display: flex; justify-content: end; margin-top: 14px; }
+    .settings-actions { display: flex; align-items: center; justify-content: end; gap: 10px; margin-top: 14px; }
     .header-link, .logout { min-height: 34px; padding: 0 10px; border: 1px solid #9eafb8; border-radius: 6px; background: transparent; color: #34434a; font-size: 13px; font-weight: 650; text-decoration: none; }
     .header-link { display: inline-flex; align-items: center; }
     .header-link:hover, .logout:hover { background: #e5ecef; color: #16222a; }
+    .secondary-button { min-height: 44px; background: transparent; border: 1px solid #9eafb8; color: #34434a; }
+    .secondary-button:hover { background: #e5ecef; }
+    .telegram-state { color: #52636b; font-size: 13px; }
     section { border-top: 2px solid #16222a; }
     h2 { margin: 18px 0 12px; font-size: 16px; }
     .empty { color: #667780; padding: 26px 0; border-top: 1px solid #dbe3e7; }
@@ -144,6 +147,19 @@
         <div class="settings-actions"><button id="save-settings" type="submit">保存默认设置</button></div>
       </form>
     </section>
+    <section class="settings-section" aria-labelledby="telegram-heading">
+      <h2 id="telegram-heading">Telegram Bot</h2>
+      <form id="telegram-form">
+        <div class="request-grid">
+          <div class="field"><label for="telegram-api-base-url">本地 Bot API Server 地址</label><input id="telegram-api-base-url" type="url" value="http://127.0.0.1:8081" required></div>
+          <div class="field"><label for="telegram-token">Bot Token</label><input id="telegram-token" type="password" autocomplete="off" placeholder="已绑定时留空以保留原 Token"></div>
+          <div class="field field-wide"><label for="telegram-chat-ids">目标 Chat ID</label><input id="telegram-chat-ids" type="text" placeholder="多个 ID 用英文逗号分隔，例如 123456,-1001234567890" required></div>
+          <div class="field check-field"><label>上传策略</label><label class="check" for="telegram-auto-upload"><input id="telegram-auto-upload" type="checkbox"> 下载完成后自动上传</label></div>
+          <div class="field"><label for="telegram-split-size">切分大小（MB）</label><input id="telegram-split-size" type="number" min="1" max="2000" value="1900" required></div>
+        </div>
+        <div class="settings-actions"><span id="telegram-state" class="telegram-state"></span><button id="unbind-telegram" class="secondary-button" type="button">解除绑定</button><button id="test-telegram" class="secondary-button" type="button">测试连接</button><button id="save-telegram" type="submit">保存 Bot 绑定</button></div>
+      </form>
+    </section>
     <section id="tasks-section" aria-labelledby="tasks-heading">
       <h2 id="tasks-heading">任务</h2>
       <div id="tasks" class="empty">暂无任务</div>
@@ -153,6 +169,7 @@
   <script>
     const form = document.querySelector('#task-form');
     const settingsForm = document.querySelector('#settings-form');
+    const telegramForm = document.querySelector('#telegram-form');
     const sourceInput = document.querySelector('#source-url');
     const userAgentInput = document.querySelector('#user-agent');
     const refererInput = document.querySelector('#referer');
@@ -174,6 +191,15 @@
     const defaultDeleteCacheInput = document.querySelector('#default-delete-cache');
     const defaultWorkerCountInput = document.querySelector('#default-worker-count');
     const saveSettings = document.querySelector('#save-settings');
+    const telegramAPIBaseURLInput = document.querySelector('#telegram-api-base-url');
+    const telegramTokenInput = document.querySelector('#telegram-token');
+    const telegramChatIDsInput = document.querySelector('#telegram-chat-ids');
+    const telegramAutoUploadInput = document.querySelector('#telegram-auto-upload');
+    const telegramSplitSizeInput = document.querySelector('#telegram-split-size');
+    const telegramState = document.querySelector('#telegram-state');
+    const saveTelegram = document.querySelector('#save-telegram');
+    const testTelegram = document.querySelector('#test-telegram');
+    const unbindTelegram = document.querySelector('#unbind-telegram');
     const labels = { queued: '等待中', running: '下载中', completed: '已完成', failed: '失败', cancelled: '已取消' };
     const phaseLabels = { downloading: '下载分片', merging: '合并中' };
     let selectedTaskID = null;
@@ -222,7 +248,8 @@
       const pause = item.status === 'running' ? `<button class="action" type="button" data-action="pause" data-id="${item.id}">暂停</button>` : '';
       const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
       const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
-      return `${pause}${resume}${cancel}`;
+      const upload = item.status === 'completed' ? `<button class="action" type="button" data-action="telegram-upload" data-id="${item.id}">上传 TG</button>` : '';
+      return `${pause}${resume}${cancel}${upload}`;
     }
 
     function renderDetail(item) {
@@ -297,6 +324,18 @@
       } catch (error) { notice.textContent = error.message; }
     }
 
+    async function loadTelegramConfiguration() {
+      try {
+        const settings = await request('/api/telegram/config');
+        telegramAPIBaseURLInput.value = settings.apiBaseUrl;
+        telegramChatIDsInput.value = settings.chatIds;
+        telegramAutoUploadInput.checked = settings.autoUpload;
+        telegramSplitSizeInput.value = String(settings.splitSizeMb);
+        telegramTokenInput.placeholder = settings.botTokenConfigured ? '已绑定，留空以保留原 Token' : '请输入 Bot Token';
+        telegramState.textContent = settings.connected ? '已绑定，正在监听 Bot 指令' : '尚未完成绑定';
+      } catch (error) { notice.textContent = error.message; }
+    }
+
     async function chooseDirectory(input, button) {
       button.disabled = true;
       notice.textContent = '';
@@ -341,6 +380,41 @@
       finally { saveSettings.disabled = false; }
     });
 
+    telegramForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      notice.textContent = '';
+      saveTelegram.disabled = true;
+      try {
+        const settings = await request('/api/telegram/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiBaseUrl: telegramAPIBaseURLInput.value, botToken: telegramTokenInput.value, chatIds: telegramChatIDsInput.value, autoUpload: telegramAutoUploadInput.checked, splitSizeMb: Number(telegramSplitSizeInput.value) }) });
+        telegramTokenInput.value = '';
+        telegramTokenInput.placeholder = settings.botTokenConfigured ? '已绑定，留空以保留原 Token' : '请输入 Bot Token';
+        telegramState.textContent = settings.connected ? '已绑定，正在监听 Bot 指令' : '尚未完成绑定';
+        notice.textContent = 'Telegram Bot 设置已保存';
+      } catch (error) { notice.textContent = error.message; }
+      finally { saveTelegram.disabled = false; }
+    });
+
+    testTelegram.addEventListener('click', async () => {
+      notice.textContent = '';
+      testTelegram.disabled = true;
+      try { await request('/api/telegram/test', { method: 'POST' }); telegramState.textContent = 'Bot API Server 连接正常'; }
+      catch (error) { notice.textContent = error.message; }
+      finally { testTelegram.disabled = false; }
+    });
+
+    unbindTelegram.addEventListener('click', async () => {
+      notice.textContent = '';
+      unbindTelegram.disabled = true;
+      try {
+        const settings = await request('/api/telegram/config', { method: 'DELETE' });
+        telegramTokenInput.value = '';
+        telegramChatIDsInput.value = '';
+        telegramAutoUploadInput.checked = false;
+        telegramState.textContent = settings.connected ? '已绑定，正在监听 Bot 指令' : '已解除绑定';
+      } catch (error) { notice.textContent = error.message; }
+      finally { unbindTelegram.disabled = false; }
+    });
+
     logout.addEventListener('click', async () => {
       try { await request('/api/auth/logout', { method: 'POST' }); } finally { window.location.assign('/login'); }
     });
@@ -376,6 +450,7 @@
 
     checkHealth();
     loadSettings();
+    loadTelegramConfiguration();
     refresh();
     setInterval(refresh, 1000);
   </script>

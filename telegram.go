@@ -1,0 +1,529 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const telegramPollTimeout = 25 * time.Second
+
+type telegramConfigRequest struct {
+	APIBaseURL  string `json:"apiBaseUrl"`
+	BotToken    string `json:"botToken"`
+	ChatIDs     string `json:"chatIds"`
+	AutoUpload  bool   `json:"autoUpload"`
+	SplitSizeMB int    `json:"splitSizeMb"`
+}
+
+type telegramConfigResponse struct {
+	APIBaseURL         string `json:"apiBaseUrl"`
+	ChatIDs            string `json:"chatIds"`
+	AutoUpload         bool   `json:"autoUpload"`
+	SplitSizeMB        int    `json:"splitSizeMb"`
+	BotTokenConfigured bool   `json:"botTokenConfigured"`
+	Connected          bool   `json:"connected"`
+}
+
+type telegramService struct {
+	manager *taskManager
+	store   *store
+	client  *http.Client
+
+	mu        sync.RWMutex
+	settings  telegramSettings
+	cancel    context.CancelFunc
+	uploading map[string]struct{}
+}
+
+func newTelegramService(storage *store, manager *taskManager) (*telegramService, error) {
+	settings, err := storage.loadTelegramSettings()
+	if err != nil {
+		return nil, err
+	}
+	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, settings: settings, uploading: make(map[string]struct{})}, nil
+}
+
+func (s *telegramService) start() {
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	settings := cloneTelegramSettings(s.settings)
+	if !telegramConfigured(settings) {
+		s.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.mu.Unlock()
+	go s.poll(ctx, settings)
+}
+
+func (s *telegramService) stop() {
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *telegramService) configuration() telegramConfigResponse {
+	s.mu.RLock()
+	settings := cloneTelegramSettings(s.settings)
+	s.mu.RUnlock()
+	return telegramConfigResponse{APIBaseURL: settings.APIBaseURL, ChatIDs: telegramChatIDsText(settings.ChatIDs), AutoUpload: settings.AutoUpload, SplitSizeMB: settings.SplitSizeMB, BotTokenConfigured: settings.BotToken != "", Connected: telegramConfigured(settings)}
+}
+
+func (s *telegramService) updateConfiguration(request telegramConfigRequest) (telegramConfigResponse, error) {
+	settings, err := normalizeTelegramConfiguration(request)
+	if err != nil {
+		return telegramConfigResponse{}, err
+	}
+	s.mu.RLock()
+	if settings.BotToken == "" {
+		settings.BotToken = s.settings.BotToken
+	}
+	s.mu.RUnlock()
+	if settings.AutoUpload && !telegramConfigured(settings) {
+		return telegramConfigResponse{}, errors.New("启用自动上传前需要配置 Bot Token 和至少一个 Chat ID")
+	}
+	if err := s.store.saveTelegramSettings(settings); err != nil {
+		return telegramConfigResponse{}, fmt.Errorf("保存 Telegram 设置失败: %w", err)
+	}
+	s.mu.Lock()
+	s.settings = settings
+	s.mu.Unlock()
+	s.start()
+	return s.configuration(), nil
+}
+
+func (s *telegramService) unbind() error {
+	settings := s.currentSettings()
+	settings.BotToken = ""
+	settings.ChatIDs = nil
+	settings.AutoUpload = false
+	if err := s.store.saveTelegramSettings(settings); err != nil {
+		return fmt.Errorf("解除 Telegram 绑定失败: %w", err)
+	}
+	s.mu.Lock()
+	s.settings = settings
+	s.mu.Unlock()
+	s.start()
+	return nil
+}
+
+func normalizeTelegramConfiguration(request telegramConfigRequest) (telegramSettings, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(request.APIBaseURL), "/")
+	parsed, err := url.ParseRequestURI(baseURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return telegramSettings{}, errors.New("Bot API 地址必须是有效的 http 或 https 地址")
+	}
+	chatIDs, err := parseTelegramChatIDs(request.ChatIDs)
+	if err != nil {
+		return telegramSettings{}, err
+	}
+	if request.SplitSizeMB < 1 || request.SplitSizeMB > 2000 {
+		return telegramSettings{}, errors.New("视频切分大小必须为 1 至 2000 MB")
+	}
+	token := strings.TrimSpace(request.BotToken)
+	if token != "" && !strings.Contains(token, ":") {
+		return telegramSettings{}, errors.New("Bot Token 格式无效")
+	}
+	return telegramSettings{APIBaseURL: baseURL, BotToken: token, ChatIDs: chatIDs, AutoUpload: request.AutoUpload, SplitSizeMB: request.SplitSizeMB}, nil
+}
+
+func (s *telegramService) testConnection(ctx context.Context) error {
+	settings := s.currentSettings()
+	if !telegramConfigured(settings) {
+		return errors.New("请先配置 Bot Token 和至少一个 Chat ID")
+	}
+	var result struct {
+		Username string `json:"username"`
+	}
+	if err := s.call(ctx, settings, "getMe", nil, &result); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *telegramService) onTaskCompleted(current *task) {
+	if s.currentSettings().AutoUpload {
+		s.queueUpload(current.ID)
+	}
+}
+
+func (s *telegramService) queueUpload(identifier string) error {
+	settings := s.currentSettings()
+	if !telegramConfigured(settings) {
+		return errors.New("Telegram Bot 尚未完成配置")
+	}
+	current := s.manager.snapshot(identifier)
+	if current == nil || current.Status != statusCompleted {
+		return errors.New("仅已完成的任务可以上传到 Telegram")
+	}
+	if _, err := os.Stat(current.OutputPath); err != nil {
+		return errors.New("待上传的视频文件不存在")
+	}
+	s.mu.Lock()
+	if _, exists := s.uploading[identifier]; exists {
+		s.mu.Unlock()
+		return errors.New("该任务正在上传到 Telegram")
+	}
+	s.uploading[identifier] = struct{}{}
+	s.mu.Unlock()
+	s.manager.addLog(identifier, "info", "Telegram 上传任务已加入队列")
+	go s.upload(identifier, settings)
+	return nil
+}
+
+func (s *telegramService) upload(identifier string, settings telegramSettings) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.uploading, identifier)
+		s.mu.Unlock()
+	}()
+	current := s.manager.snapshot(identifier)
+	if current == nil {
+		return
+	}
+	limitBytes := int64(settings.SplitSizeMB) * 1_000_000
+	parts, cleanup, err := splitTelegramFile(current.OutputPath, limitBytes)
+	if err != nil {
+		s.manager.addLog(identifier, "error", "Telegram 视频切分失败: "+err.Error())
+		return
+	}
+	defer cleanup()
+	s.manager.addLog(identifier, "info", fmt.Sprintf("开始上传到 Telegram，共 %d 个文件段", len(parts)))
+	context := context.Background()
+	for _, chatID := range settings.ChatIDs {
+		for index, part := range parts {
+			caption := current.OutputName
+			method := "sendVideo"
+			field := "video"
+			if len(parts) > 1 {
+				caption = fmt.Sprintf("%s (%d/%d)", current.OutputName, index+1, len(parts))
+				method, field = "sendDocument", "document"
+			}
+			payload := map[string]any{"chat_id": chatID, field: telegramFileURI(part), "caption": caption}
+			if err := s.call(context, settings, method, payload, nil); err != nil {
+				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 上传失败（Chat %d，第 %d 段）: %v", chatID, index+1, err))
+				return
+			}
+			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 文件段 %d/%d 到 Chat %d", index+1, len(parts), chatID))
+		}
+	}
+	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
+}
+
+func (s *telegramService) poll(ctx context.Context, settings telegramSettings) {
+	_ = s.call(ctx, settings, "deleteWebhook", map[string]any{"drop_pending_updates": false}, nil)
+	var offset int64
+	for ctx.Err() == nil {
+		var updates []telegramUpdate
+		err := s.call(ctx, settings, "getUpdates", map[string]any{"offset": offset, "timeout": int(telegramPollTimeout.Seconds()), "allowed_updates": []string{"message", "channel_post", "callback_query"}}, &updates)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("Telegram Bot 长轮询失败: %v", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(3 * time.Second):
+				}
+			}
+			continue
+		}
+		for _, update := range updates {
+			offset = update.UpdateID + 1
+			s.handleUpdate(ctx, settings, update)
+		}
+	}
+}
+
+func (s *telegramService) handleUpdate(ctx context.Context, settings telegramSettings, update telegramUpdate) {
+	message := update.Message
+	if message == nil {
+		message = update.ChannelPost
+	}
+	if message != nil {
+		if !telegramChatAllowed(settings, message.Chat.ID) {
+			return
+		}
+		text := strings.TrimSpace(strings.Split(message.Text, "@")[0])
+		switch text {
+		case "/start", "/menu", "/tasks", "/completed":
+			s.sendTaskList(ctx, settings, message.Chat.ID, text == "/completed")
+		}
+		return
+	}
+	if update.CallbackQuery == nil || update.CallbackQuery.Message == nil {
+		return
+	}
+	chatID := update.CallbackQuery.Message.Chat.ID
+	if !telegramChatAllowed(settings, chatID) {
+		return
+	}
+	_ = s.call(ctx, settings, "answerCallbackQuery", map[string]any{"callback_query_id": update.CallbackQuery.ID}, nil)
+	s.handleCallback(ctx, settings, chatID, update.CallbackQuery.Data)
+}
+
+func (s *telegramService) handleCallback(ctx context.Context, settings telegramSettings, chatID int64, data string) {
+	if data == "tasks" || data == "completed" {
+		s.sendTaskList(ctx, settings, chatID, data == "completed")
+		return
+	}
+	parts := strings.SplitN(data, ":", 2)
+	if len(parts) != 2 {
+		return
+	}
+	identifier := parts[1]
+	switch parts[0] {
+	case "task", "refresh":
+		s.sendTaskDetails(ctx, settings, chatID, identifier)
+	case "pause":
+		s.manager.pause(identifier)
+		s.sendTaskDetails(ctx, settings, chatID, identifier)
+	case "resume":
+		s.manager.resume(identifier)
+		s.sendTaskDetails(ctx, settings, chatID, identifier)
+	case "cancel":
+		s.manager.cancel(identifier)
+		s.sendTaskDetails(ctx, settings, chatID, identifier)
+	case "upload":
+		if err := s.queueUpload(identifier); err != nil {
+			_ = s.sendMessage(ctx, settings, chatID, err.Error(), nil)
+			return
+		}
+		_ = s.sendMessage(ctx, settings, chatID, "已开始上传，进度会写入网页任务日志。", nil)
+	}
+}
+
+func (s *telegramService) sendTaskList(ctx context.Context, settings telegramSettings, chatID int64, completedOnly bool) {
+	items := s.manager.all()
+	sort.Slice(items, func(left, right int) bool { return items[left].CreatedAt.After(items[right].CreatedAt) })
+	keyboard := telegramInlineKeyboard{}
+	count := 0
+	for _, current := range items {
+		if completedOnly && current.Status != statusCompleted {
+			continue
+		}
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: fmt.Sprintf("%s · %s", current.OutputName, telegramStatusLabel(current.Status)), CallbackData: "task:" + current.ID}})
+		count++
+		if count == 8 {
+			break
+		}
+	}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "全部任务", CallbackData: "tasks"}, {Text: "已完成", CallbackData: "completed"}})
+	message := "暂无任务"
+	if count > 0 {
+		message = "选择任务查看详情："
+	}
+	_ = s.sendMessage(ctx, settings, chatID, message, keyboard)
+}
+
+func (s *telegramService) sendTaskDetails(ctx context.Context, settings telegramSettings, chatID int64, identifier string) {
+	current := s.manager.snapshot(identifier)
+	if current == nil {
+		_ = s.sendMessage(ctx, settings, chatID, "任务不存在。", nil)
+		return
+	}
+	text := fmt.Sprintf("%s\n状态：%s\n%s", current.OutputName, telegramStatusLabel(current.Status), telegramTaskProgress(current))
+	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "刷新", CallbackData: "refresh:" + current.ID}, {Text: "任务列表", CallbackData: "tasks"}}}}
+	if current.Status == statusRunning {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "暂停", CallbackData: "pause:" + current.ID}, {Text: "取消", CallbackData: "cancel:" + current.ID}})
+	}
+	if current.Status == statusPaused {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "继续", CallbackData: "resume:" + current.ID}, {Text: "取消", CallbackData: "cancel:" + current.ID}})
+	}
+	if current.Status == statusCompleted {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "上传视频", CallbackData: "upload:" + current.ID}})
+	}
+	_ = s.sendMessage(ctx, settings, chatID, text, keyboard)
+}
+
+func (s *telegramService) sendMessage(ctx context.Context, settings telegramSettings, chatID int64, text string, keyboard any) error {
+	payload := map[string]any{"chat_id": chatID, "text": text}
+	if keyboard != nil {
+		payload["reply_markup"] = keyboard
+	}
+	return s.call(ctx, settings, "sendMessage", payload, nil)
+}
+
+func (s *telegramService) call(ctx context.Context, settings telegramSettings, method string, payload any, result any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(settings.APIBaseURL, "/")+"/bot"+settings.BotToken+"/"+method, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return errors.New("无法连接本地 Bot API Server")
+	}
+	defer response.Body.Close()
+	var decoded telegramResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2*1024*1024)).Decode(&decoded); err != nil {
+		return errors.New("Bot API 返回无效响应")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || !decoded.OK {
+		if decoded.Description != "" {
+			return errors.New(decoded.Description)
+		}
+		return fmt.Errorf("Bot API 返回 HTTP %d", response.StatusCode)
+	}
+	if result != nil && len(decoded.Result) > 0 {
+		if err := json.Unmarshal(decoded.Result, result); err != nil {
+			return errors.New("Bot API 返回数据无效")
+		}
+	}
+	return nil
+}
+
+func (s *telegramService) currentSettings() telegramSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneTelegramSettings(s.settings)
+}
+
+func cloneTelegramSettings(settings telegramSettings) telegramSettings {
+	settings.ChatIDs = append([]int64(nil), settings.ChatIDs...)
+	return settings
+}
+
+func telegramConfigured(settings telegramSettings) bool {
+	return settings.BotToken != "" && settings.APIBaseURL != "" && len(settings.ChatIDs) > 0
+}
+
+func telegramChatAllowed(settings telegramSettings, identifier int64) bool {
+	for _, chatID := range settings.ChatIDs {
+		if chatID == identifier {
+			return true
+		}
+	}
+	return false
+}
+
+func telegramStatusLabel(status taskStatus) string {
+	labels := map[taskStatus]string{statusQueued: "等待中", statusRunning: "下载中", statusPaused: "已暂停", statusCompleted: "已完成", statusFailed: "失败", statusCancelled: "已取消"}
+	return labels[status]
+}
+
+func telegramTaskProgress(current *task) string {
+	if current.Phase == "downloading" && current.TotalSegments > 0 {
+		return fmt.Sprintf("分片：%d/%d", current.CompletedSegments, current.TotalSegments)
+	}
+	if current.Phase == "merging" {
+		return "正在合并 MP4"
+	}
+	return "等待处理"
+}
+
+func splitTelegramFile(path string, maxBytes int64) ([]string, func(), error) {
+	if maxBytes <= 0 {
+		return nil, nil, errors.New("切分大小无效")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Size() <= maxBytes {
+		return []string{path}, func() {}, nil
+	}
+	directory, err := os.MkdirTemp("", "m3u8-telegram-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(directory) }
+	input, err := os.Open(path)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	defer input.Close()
+	parts := make([]string, 0, (info.Size()+maxBytes-1)/maxBytes)
+	buffer := make([]byte, 1024*1024)
+	for index, remaining := 1, info.Size(); remaining > 0; index++ {
+		partPath := filepath.Join(directory, fmt.Sprintf("%s.part%03d", filepath.Base(path), index))
+		output, err := os.Create(partPath)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		copied, copyErr := io.CopyBuffer(output, io.LimitReader(input, maxBytes), buffer)
+		closeErr := output.Close()
+		if copyErr != nil || closeErr != nil || copied == 0 {
+			cleanup()
+			if copyErr != nil {
+				return nil, nil, copyErr
+			}
+			return nil, nil, closeErr
+		}
+		parts = append(parts, partPath)
+		remaining -= copied
+	}
+	return parts, cleanup, nil
+}
+
+func telegramFileURI(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	pathValue := "/" + strings.TrimPrefix(filepath.ToSlash(abs), "/")
+	return (&url.URL{Scheme: "file", Path: pathValue}).String()
+}
+
+type telegramResponse struct {
+	OK          bool            `json:"ok"`
+	Description string          `json:"description"`
+	Result      json.RawMessage `json:"result"`
+}
+
+type telegramUpdate struct {
+	UpdateID      int64                  `json:"update_id"`
+	Message       *telegramMessage       `json:"message"`
+	ChannelPost   *telegramMessage       `json:"channel_post"`
+	CallbackQuery *telegramCallbackQuery `json:"callback_query"`
+}
+
+type telegramMessage struct {
+	Chat telegramChat `json:"chat"`
+	Text string       `json:"text"`
+}
+
+type telegramChat struct {
+	ID int64 `json:"id"`
+}
+
+type telegramCallbackQuery struct {
+	ID      string           `json:"id"`
+	Data    string           `json:"data"`
+	Message *telegramMessage `json:"message"`
+}
+
+type telegramInlineKeyboard struct {
+	InlineKeyboard [][]telegramInlineButton `json:"inline_keyboard"`
+}
+
+type telegramInlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}

@@ -46,6 +46,13 @@ func main() {
 		log.Fatal(err)
 	}
 	manager.restore(items)
+	telegram, err := newTelegramService(storage, manager)
+	if err != nil {
+		log.Fatal(err)
+	}
+	manager.setCompletionHandler(telegram.onTaskCompleted)
+	telegram.start()
+	defer telegram.stop()
 	manager.proxyBaseURL = "http://" + address
 	staticFiles, err := fs.Sub(webFiles, "web")
 	if err != nil {
@@ -54,7 +61,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              address,
-		Handler:           newAPIHandler(manager, newAuthService(storage), http.FileServer(http.FS(staticFiles))),
+		Handler:           newAPIHandler(manager, newAuthService(storage), telegram, http.FileServer(http.FS(staticFiles))),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("服务已启动：http://%s", address)

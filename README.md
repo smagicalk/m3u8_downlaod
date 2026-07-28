@@ -12,6 +12,8 @@
 - 保存目录与缓存目录既可手动输入，也可通过 Windows 系统目录选择器选择。
 - 可选在合并成功后删除临时缓存；取消或失败时会保留缓存。重新提交相同来源和输出名时会自动复用已完成分片。
 - 内置本地管理员登录、退出和密码修改；密码仅以 bcrypt 散列形式保存在 SQLite。
+- 支持绑定本地 Telegram Bot API Server，多个私聊、群组或频道 Chat ID 可接收视频；Bot 提供任务列表、进度、暂停、继续、取消和上传按钮。
+- 完成视频可手动或自动上传 Telegram；超过设置大小时会生成顺序文件段上传，默认每段 `1900 MB`，上传完成后自动清理临时分段。
 
 ## 前置条件
 
@@ -46,5 +48,15 @@ go run . -ffmpeg-path H:/video/ffmpeg.exe
 ```
 
 SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会将默认保存目录、缓存目录、缓存清理策略和分片并发数写入数据库，可在主页“默认设置”中修改。
+
+## Telegram Bot
+
+需要先启动官方本地 Bot API Server，并启用 `--local`：
+
+```powershell
+telegram-bot-api --api-id "你的 API ID" --api-hash "你的 API Hash" --local
+```
+
+默认服务地址为 `http://127.0.0.1:8081`。登录下载器后，在主页的“Telegram Bot”区域填写 Bot Token、一个或多个目标 Chat ID、自动上传选项和切分大小。多个 Chat ID 以英文逗号分隔；私聊、群组和频道均可作为发送目标。Bot 只处理已绑定 Chat ID 的 `/start`、`/tasks`、`/completed` 和内联按钮操作。
 
 请仅下载你拥有访问和保存权限的媒体内容。

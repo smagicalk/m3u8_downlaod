@@ -24,6 +24,7 @@ type taskManager struct {
 	httpClient   *http.Client
 	store        *store
 	defaults     appSettings
+	onCompleted  func(*task)
 }
 
 func newTaskManager(outputDir string) *taskManager {
@@ -97,6 +98,12 @@ func (m *taskManager) restore(items []*task) {
 		}
 		m.tasks[current.ID] = current
 	}
+}
+
+func (m *taskManager) setCompletionHandler(handler func(*task)) {
+	m.mu.Lock()
+	m.onCompleted = handler
+	m.mu.Unlock()
 }
 
 func (m *taskManager) create(sourceURL, referer, cookie, userAgent, mode, outputName, outputDir, cacheDir string, deleteCache bool, workerCount int) (*task, error) {
@@ -339,22 +346,28 @@ func (m *taskManager) playlistProxyURL(identifier string) string {
 
 func (m *taskManager) finish(identifier string, status taskStatus, message string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if current := m.tasks[identifier]; current != nil {
-		if current.Status == statusCancelled {
-			return
-		}
-		finished := time.Now()
-		current.Status = status
-		current.Error = message
-		current.FinishedAt = &finished
-		if status == statusCompleted {
-			appendTaskLog(current, "info", "任务已完成")
-		} else if message != "" {
-			appendTaskLog(current, "error", message)
-		}
-		m.persistTaskLocked(current)
-		m.persistLogLocked(current)
+	current := m.tasks[identifier]
+	if current == nil || current.Status == statusCancelled {
+		m.mu.Unlock()
+		return
+	}
+	finished := time.Now()
+	current.Status = status
+	current.Error = message
+	current.FinishedAt = &finished
+	if status == statusCompleted {
+		appendTaskLog(current, "info", "任务已完成")
+	} else if message != "" {
+		appendTaskLog(current, "error", message)
+	}
+	m.persistTaskLocked(current)
+	m.persistLogLocked(current)
+	handler := m.onCompleted
+	copy := *current
+	copy.Logs = append([]taskLog(nil), current.Logs...)
+	m.mu.Unlock()
+	if status == statusCompleted && handler != nil {
+		handler(&copy)
 	}
 }
 

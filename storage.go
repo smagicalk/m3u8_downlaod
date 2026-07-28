@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,6 +19,14 @@ type appSettings struct {
 	CacheDir    string `json:"cacheDirectory"`
 	DeleteCache bool   `json:"deleteCache"`
 	WorkerCount int    `json:"workerCount"`
+}
+
+type telegramSettings struct {
+	APIBaseURL  string
+	BotToken    string
+	ChatIDs     []int64
+	AutoUpload  bool
+	SplitSizeMB int
 }
 
 type store struct {
@@ -170,6 +179,105 @@ func (s *store) saveSettings(settings appSettings) error {
 		}
 	}
 	return transaction.Commit()
+}
+
+func defaultTelegramSettings() telegramSettings {
+	return telegramSettings{APIBaseURL: "http://127.0.0.1:8081", SplitSizeMB: 1900}
+}
+
+func (s *store) loadTelegramSettings() (telegramSettings, error) {
+	defaults := defaultTelegramSettings()
+	values := map[string]string{
+		"telegram_api_base_url":  defaults.APIBaseURL,
+		"telegram_bot_token":     "",
+		"telegram_chat_ids":      "",
+		"telegram_auto_upload":   "false",
+		"telegram_split_size_mb": strconv.Itoa(defaults.SplitSizeMB),
+	}
+	for key, value := range values {
+		if _, err := s.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {
+			return telegramSettings{}, err
+		}
+	}
+	rows, err := s.db.Query(`SELECT key, value FROM settings WHERE key LIKE 'telegram_%'`)
+	if err != nil {
+		return telegramSettings{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return telegramSettings{}, err
+		}
+		values[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return telegramSettings{}, err
+	}
+	chatIDs, err := parseTelegramChatIDs(values["telegram_chat_ids"])
+	if err != nil {
+		return telegramSettings{}, err
+	}
+	autoUpload, err := strconv.ParseBool(values["telegram_auto_upload"])
+	if err != nil {
+		return telegramSettings{}, errors.New("Telegram 自动上传设置无效")
+	}
+	splitSize, err := strconv.Atoi(values["telegram_split_size_mb"])
+	if err != nil || splitSize < 1 || splitSize > 2000 {
+		return telegramSettings{}, errors.New("Telegram 切分大小必须为 1 至 2000 MB")
+	}
+	return telegramSettings{APIBaseURL: strings.TrimRight(strings.TrimSpace(values["telegram_api_base_url"]), "/"), BotToken: strings.TrimSpace(values["telegram_bot_token"]), ChatIDs: chatIDs, AutoUpload: autoUpload, SplitSizeMB: splitSize}, nil
+}
+
+func (s *store) saveTelegramSettings(settings telegramSettings) error {
+	values := map[string]string{
+		"telegram_api_base_url":  settings.APIBaseURL,
+		"telegram_bot_token":     settings.BotToken,
+		"telegram_chat_ids":      telegramChatIDsText(settings.ChatIDs),
+		"telegram_auto_upload":   strconv.FormatBool(settings.AutoUpload),
+		"telegram_split_size_mb": strconv.Itoa(settings.SplitSizeMB),
+	}
+	transaction, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+	for key, value := range values {
+		if _, err := transaction.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	return transaction.Commit()
+}
+
+func parseTelegramChatIDs(raw string) ([]int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.FieldsFunc(raw, func(character rune) bool {
+		return character == ',' || character == '\n' || character == '\r' || character == ' ' || character == '\t'
+	})
+	seen := make(map[int64]struct{}, len(parts))
+	chatIDs := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		identifier, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || identifier == 0 {
+			return nil, errors.New("Telegram Chat ID 格式无效")
+		}
+		if _, exists := seen[identifier]; !exists {
+			seen[identifier] = struct{}{}
+			chatIDs = append(chatIDs, identifier)
+		}
+	}
+	return chatIDs, nil
+}
+
+func telegramChatIDsText(chatIDs []int64) string {
+	items := make([]string, 0, len(chatIDs))
+	for _, identifier := range chatIDs {
+		items = append(items, strconv.FormatInt(identifier, 10))
+	}
+	return strings.Join(items, ",")
 }
 
 func (s *store) saveTask(current *task) error {

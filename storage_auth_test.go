@@ -56,7 +56,11 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 	t.Cleanup(func() { _ = storage.close() })
 	settings := appSettings{OutputDir: t.TempDir(), CacheDir: t.TempDir(), DeleteCache: true, WorkerCount: 8}
 	manager := newTaskManagerWithStore(settings, storage)
-	handler := newAPIHandler(manager, newAuthService(storage), http.FileServer(http.Dir("web")))
+	telegram, err := newTelegramService(storage, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newAPIHandler(manager, newAuthService(storage), telegram, http.FileServer(http.Dir("web")))
 
 	unauthorized := httptest.NewRecorder()
 	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/tasks", nil))
