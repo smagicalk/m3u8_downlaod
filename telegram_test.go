@@ -137,24 +137,84 @@ func TestTelegramSubmissionPromptAndTaskControls(t *testing.T) {
 	defer server.Close()
 	manager := newTaskManager(t.TempDir())
 	manager.tasks["task-1"] = &task{ID: "task-1", OutputName: "video.mp4", Status: statusRunning, Phase: "downloading"}
-	service := &telegramService{manager: manager, client: server.Client(), uploading: make(map[string]struct{}), submissions: make(map[int64]struct{})}
+	service := &telegramService{manager: manager, client: server.Client(), uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}, SplitSizeMB: 1900}
 
 	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{Chat: telegramChat{ID: 42}, Text: "/start"}})
 	if len(messages) != 1 || !telegramKeyboardHasCallback(messages[0].ReplyMarkup, "submit") {
 		t.Fatal("Telegram menu must include a submit button")
 	}
-	service.handleCallback(context.Background(), settings, 42, "submit")
+	service.handleCallback(context.Background(), settings, 42, 0, "submit")
 	if !service.awaitingSubmission(42) {
 		t.Fatal("submit button must put the chat into URL input mode")
 	}
-	service.handleCallback(context.Background(), settings, 42, "pause:task-1")
+	service.handleCallback(context.Background(), settings, 42, 0, "pause:task-1")
 	if status := manager.snapshot("task-1").Status; status != statusPaused {
 		t.Fatalf("paused task status = %q, want %q", status, statusPaused)
 	}
-	service.handleCallback(context.Background(), settings, 42, "stop:task-1")
+	service.handleCallback(context.Background(), settings, 42, 0, "stop:task-1")
 	if status := manager.snapshot("task-1").Status; status != statusCancelled {
 		t.Fatalf("stopped task status = %q, want %q", status, statusCancelled)
+	}
+}
+
+func TestTelegramSubmissionCollectsParametersBeforeCreatingTask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/sendMessage") {
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	manager := newTaskManager(t.TempDir())
+	service := &telegramService{manager: manager, client: server.Client(), uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}, SplitSizeMB: 1900}
+
+	service.beginSubmission(context.Background(), settings, 42)
+	for _, value := range []string{"https://example.com/video.m3u8", "https://example.com/page", "session=value", "custom-video"} {
+		if !service.handleSubmissionMessage(context.Background(), settings, 42, value) {
+			t.Fatalf("submission message %q was not handled", value)
+		}
+	}
+	service.handleCallback(context.Background(), settings, 42, 0, "submit-worker:4")
+
+	service.mu.RLock()
+	submission := *service.submissions[42]
+	service.mu.RUnlock()
+	if submission.Step != telegramSubmissionCache || submission.WorkerCount != 4 {
+		t.Fatalf("submission state = %#v", submission)
+	}
+	if submission.SourceURL != "https://example.com/video.m3u8" || submission.Referer != "https://example.com/page" || submission.Cookie != "session=value" || submission.OutputName != "custom-video" {
+		t.Fatalf("submission parameters = %#v", submission)
+	}
+}
+
+func TestTelegramTaskRefreshEditsExistingMessage(t *testing.T) {
+	var payload struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int    `json:"message_id"`
+		Text      string `json:"text"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/editMessageText") {
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	manager := newTaskManager(t.TempDir())
+	manager.tasks["task-1"] = &task{ID: "task-1", OutputName: "video.mp4", Status: statusRunning, Phase: "downloading"}
+	service := &telegramService{manager: manager, client: server.Client(), uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}, SplitSizeMB: 1900}
+
+	if err := service.editTaskDetails(context.Background(), settings, 42, 77, "task-1"); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ChatID != 42 || payload.MessageID != 77 || !strings.Contains(payload.Text, "video.mp4") {
+		t.Fatalf("edited payload = %#v", payload)
 	}
 }
 

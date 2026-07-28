@@ -83,6 +83,7 @@ func newAPIHandler(manager *taskManager, auth *authService, telegram *telegramSe
 	})
 	protected.HandleFunc("GET /password", serveStaticPage(staticFiles, "/password.html"))
 	protected.HandleFunc("GET /settings", serveStaticPage(staticFiles, "/settings.html"))
+	protected.HandleFunc("GET /tasks/{id}", serveStaticPage(staticFiles, "/task.html"))
 	registerTaskRoutes(protected, manager, telegram)
 	protected.Handle("GET /", staticFiles)
 	public.Handle("/", auth.require(protected))
@@ -109,6 +110,14 @@ func registerTaskRoutes(mux *http.ServeMux, manager *taskManager, telegram *tele
 	})
 	mux.HandleFunc("GET /api/tasks", func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, manager.all())
+	})
+	mux.HandleFunc("GET /api/tasks/{id}", func(writer http.ResponseWriter, request *http.Request) {
+		current := manager.snapshot(request.PathValue("id"))
+		if current == nil {
+			writeError(writer, http.StatusNotFound, "任务不存在")
+			return
+		}
+		writeJSON(writer, http.StatusOK, current)
 	})
 	mux.HandleFunc("POST /api/tasks", func(writer http.ResponseWriter, request *http.Request) {
 		var payload createRequest

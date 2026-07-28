@@ -316,7 +316,7 @@
       }
       if (event.target.closest('a, button')) return;
       const item = event.target.closest('[data-task-id]');
-      if (item) { selectedTaskID = item.dataset.taskId; render(await request('/api/tasks')); }
+      if (item) window.location.assign(`/tasks/${encodeURIComponent(item.dataset.taskId)}`);
     });
 
     tasks.addEventListener('keydown', async (event) => {
@@ -324,8 +324,7 @@
       const item = event.target.closest('[data-task-id]');
       if (!item) return;
       event.preventDefault();
-      selectedTaskID = item.dataset.taskId;
-      render(await request('/api/tasks'));
+      window.location.assign(`/tasks/${encodeURIComponent(item.dataset.taskId)}`);
     });
 
     taskDetail.addEventListener('click', async (event) => {

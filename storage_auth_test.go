@@ -93,6 +93,21 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 	if settingsPage.Code != http.StatusOK || !bytes.Contains(settingsPage.Body.Bytes(), []byte(`id="telegram-form"`)) {
 		t.Fatalf("settings page = %d, contains Telegram form = %t", settingsPage.Code, bytes.Contains(settingsPage.Body.Bytes(), []byte(`id="telegram-form"`)))
 	}
+	manager.tasks["task-1"] = &task{ID: "task-1", OutputName: "video.mp4", Status: statusRunning}
+	taskPage := httptest.NewRecorder()
+	taskPageRequest := httptest.NewRequest(http.MethodGet, "/tasks/task-1", nil)
+	taskPageRequest.AddCookie(cookie)
+	handler.ServeHTTP(taskPage, taskPageRequest)
+	if taskPage.Code != http.StatusOK || !bytes.Contains(taskPage.Body.Bytes(), []byte(`id="task-log"`)) {
+		t.Fatalf("task page = %d, contains log view = %t", taskPage.Code, bytes.Contains(taskPage.Body.Bytes(), []byte(`id="task-log"`)))
+	}
+	taskAPI := httptest.NewRecorder()
+	taskAPIRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/task-1", nil)
+	taskAPIRequest.AddCookie(cookie)
+	handler.ServeHTTP(taskAPI, taskAPIRequest)
+	if taskAPI.Code != http.StatusOK || !bytes.Contains(taskAPI.Body.Bytes(), []byte(`"id":"task-1"`)) {
+		t.Fatalf("task API = %d: %s", taskAPI.Code, taskAPI.Body.String())
+	}
 
 	changeBody, _ := json.Marshal(changePasswordRequest{CurrentPassword: "InitialPass123", NewPassword: "ChangedPass123"})
 	change := httptest.NewRecorder()
