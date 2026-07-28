@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,7 +149,7 @@ func TestTelegramFileUploadStreamsMultipartContent(t *testing.T) {
 	service := &telegramService{client: server.Client()}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
-	if err := service.sendFile(context.Background(), settings, "sendDocument", 42, "document", path, "video.mp4 (1/3)"); err != nil {
+	if err := service.sendFile(context.Background(), settings, "sendDocument", 42, "document", path, "video.mp4 (1/3)", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -201,8 +203,70 @@ func TestTelegramMediaGroupStreamsVideoAlbum(t *testing.T) {
 	service := &telegramService{client: server.Client()}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
-	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2); err != nil {
+	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTelegramMediaGroupReportsUploadedMediaBytes(t *testing.T) {
+	directory := t.TempDir()
+	parts := []string{filepath.Join(directory, "video.part001"), filepath.Join(directory, "video.part002")}
+	for index, path := range parts {
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("video-content-%d", index+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		_, _ = writer.Write([]byte(`{"ok":true,"result":[]}`))
+	}))
+	defer server.Close()
+	service := &telegramService{uploadClient: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+	var uploaded atomic.Int64
+
+	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(len("video-content-1") + len("video-content-2")); uploaded.Load() != want {
+		t.Fatalf("uploaded bytes = %d, want %d", uploaded.Load(), want)
+	}
+}
+
+func TestTelegramTaskListPaginatesEightTasksPerPage(t *testing.T) {
+	manager := newTaskManager(t.TempDir())
+	for index := 0; index < 17; index++ {
+		identifier := fmt.Sprintf("task-%02d", index)
+		manager.tasks[identifier] = &task{ID: identifier, OutputName: fmt.Sprintf("video-%02d.mp4", index), Status: statusCompleted, CreatedAt: time.Unix(int64(index), 0)}
+	}
+	service := &telegramService{manager: manager}
+	text, keyboard := service.taskListPage(false, 1)
+	if !strings.Contains(text, "第 2/3 页") {
+		t.Fatalf("page text = %q", text)
+	}
+	if !telegramKeyboardHasCallback(keyboard, "tasks-page:all:0") || !telegramKeyboardHasCallback(keyboard, "tasks-page:all:2") {
+		t.Fatalf("page keyboard = %#v", keyboard)
+	}
+	itemCount := 0
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if strings.HasPrefix(button.CallbackData, "task:") {
+				itemCount++
+			}
+		}
+	}
+	if itemCount != 8 {
+		t.Fatalf("task count on page = %d, want 8", itemCount)
+	}
+}
+
+func TestTelegramTransportErrorPreservesCauseWithoutToken(t *testing.T) {
+	err := telegramTransportError(&url.Error{Op: "Post", URL: "http://127.0.0.1:8081/bot123:secret/sendMediaGroup", Err: errors.New("connection reset by peer")})
+	if !strings.Contains(err.Error(), "connection reset by peer") {
+		t.Fatalf("error must contain connection cause: %v", err)
+	}
+	if strings.Contains(err.Error(), "123:secret") {
+		t.Fatalf("error must not contain bot token: %v", err)
 	}
 }
 
@@ -223,7 +287,7 @@ func TestTelegramMediaGroupDoesNotUsePollTimeout(t *testing.T) {
 	service := &telegramService{client: &http.Client{Timeout: 10 * time.Millisecond}}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
-	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2); err != nil {
+	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
 		t.Fatalf("large upload must not use the poll timeout: %v", err)
 	}
 }

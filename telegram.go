@@ -22,6 +22,8 @@ import (
 const telegramPollTimeout = 25 * time.Second
 const telegramTaskRefreshInterval = 3 * time.Second
 const telegramMediaGroupMaxItems = 10
+const telegramTaskListPageSize = 8
+const telegramUploadLogStepPercent = 5
 
 const (
 	telegramSubmissionSource  = "source"
@@ -55,12 +57,13 @@ type telegramService struct {
 	client       *http.Client
 	uploadClient *http.Client
 
-	mu          sync.RWMutex
-	settings    telegramSettings
-	cancel      context.CancelFunc
-	uploading   map[string]struct{}
-	submissions map[int64]*telegramSubmission
-	views       map[telegramTaskView]*telegramTaskSubscription
+	mu             sync.RWMutex
+	settings       telegramSettings
+	cancel         context.CancelFunc
+	uploading      map[string]struct{}
+	uploadProgress map[string]*telegramUploadProgress
+	submissions    map[int64]*telegramSubmission
+	views          map[telegramTaskView]*telegramTaskSubscription
 }
 
 type telegramSubmission struct {
@@ -82,12 +85,24 @@ type telegramTaskSubscription struct {
 	cancel context.CancelFunc
 }
 
+type telegramUploadProgress struct {
+	TotalBytes    int64
+	UploadedBytes int64
+	ChatID        int64
+	ChatIndex     int
+	ChatTotal     int
+	StartPart     int
+	EndPart       int
+	TotalParts    int
+	NextLogAt     int
+}
+
 func newTelegramService(storage *store, manager *taskManager) (*telegramService, error) {
 	settings, err := storage.loadTelegramSettings()
 	if err != nil {
 		return nil, err
 	}
-	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, uploadClient: &http.Client{}, settings: settings, uploading: make(map[string]struct{}), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}, nil
+	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, uploadClient: &http.Client{}, settings: settings, uploading: make(map[string]struct{}), uploadProgress: make(map[string]*telegramUploadProgress), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}, nil
 }
 
 func (s *telegramService) start() {
@@ -218,11 +233,18 @@ func (s *telegramService) queueUpload(identifier string) error {
 		return errors.New("待上传的视频文件不存在")
 	}
 	s.mu.Lock()
+	if s.uploading == nil {
+		s.uploading = make(map[string]struct{})
+	}
+	if s.uploadProgress == nil {
+		s.uploadProgress = make(map[string]*telegramUploadProgress)
+	}
 	if _, exists := s.uploading[identifier]; exists {
 		s.mu.Unlock()
 		return errors.New("该任务正在上传到 Telegram")
 	}
 	s.uploading[identifier] = struct{}{}
+	s.uploadProgress[identifier] = &telegramUploadProgress{NextLogAt: telegramUploadLogStepPercent}
 	s.mu.Unlock()
 	s.manager.addLog(identifier, "info", "Telegram 上传任务已加入队列")
 	go s.upload(identifier, settings)
@@ -233,6 +255,7 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.uploading, identifier)
+		delete(s.uploadProgress, identifier)
 		s.mu.Unlock()
 	}()
 	current := s.manager.snapshot(identifier)
@@ -246,11 +269,18 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		return
 	}
 	defer cleanup()
-	s.manager.addLog(identifier, "info", fmt.Sprintf("开始上传到 Telegram，共 %d 个文件段", len(parts)))
+	partBytes, err := telegramMediaBytes(parts)
+	if err != nil {
+		s.manager.addLog(identifier, "error", "读取 Telegram 待上传文件失败: "+err.Error())
+		return
+	}
+	s.configureUploadProgress(identifier, partBytes*int64(len(settings.ChatIDs)), len(settings.ChatIDs), len(parts))
+	s.manager.addLog(identifier, "info", fmt.Sprintf("开始上传到 Telegram，共 %d 个文件段，待传输 %s", len(parts), telegramFormatBytes(partBytes*int64(len(settings.ChatIDs)))))
 	context := context.Background()
-	for _, chatID := range settings.ChatIDs {
+	for chatIndex, chatID := range settings.ChatIDs {
 		if len(parts) == 1 {
-			if err := s.sendFile(context, settings, "sendVideo", chatID, "video", parts[0], current.OutputName); err != nil {
+			s.setUploadStage(identifier, chatID, chatIndex+1, len(settings.ChatIDs), 1, 1, len(parts))
+			if err := s.sendFile(context, settings, "sendVideo", chatID, "video", parts[0], current.OutputName, func(delta int64) { s.recordUploadProgress(identifier, delta) }); err != nil {
 				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 上传失败（Chat %d）: %v", chatID, err))
 				return
 			}
@@ -259,7 +289,8 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		}
 		for start := 0; start < len(parts); {
 			end := telegramMediaGroupEnd(start, len(parts))
-			if err := s.sendMediaGroup(context, settings, chatID, parts[start:end], current.OutputName, start+1, len(parts)); err != nil {
+			s.setUploadStage(identifier, chatID, chatIndex+1, len(settings.ChatIDs), start+1, end, len(parts))
+			if err := s.sendMediaGroup(context, settings, chatID, parts[start:end], current.OutputName, start+1, len(parts), func(delta int64) { s.recordUploadProgress(identifier, delta) }); err != nil {
 				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 视频相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
 				return
 			}
@@ -268,6 +299,118 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		}
 	}
 	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
+}
+
+func telegramMediaBytes(paths []string) (int64, error) {
+	var total int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
+func (s *telegramService) configureUploadProgress(identifier string, totalBytes int64, chatTotal, totalParts int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return
+	}
+	progress.TotalBytes = totalBytes
+	progress.ChatTotal = chatTotal
+	progress.TotalParts = totalParts
+}
+
+func (s *telegramService) setUploadStage(identifier string, chatID int64, chatIndex, chatTotal, startPart, endPart, totalParts int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return
+	}
+	progress.ChatID = chatID
+	progress.ChatIndex = chatIndex
+	progress.ChatTotal = chatTotal
+	progress.StartPart = startPart
+	progress.EndPart = endPart
+	progress.TotalParts = totalParts
+}
+
+func (s *telegramService) recordUploadProgress(identifier string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	var message string
+	s.mu.Lock()
+	progress := s.uploadProgress[identifier]
+	if progress != nil {
+		progress.UploadedBytes += delta
+		if progress.TotalBytes > 0 && progress.UploadedBytes > progress.TotalBytes {
+			progress.UploadedBytes = progress.TotalBytes
+		}
+		percent := telegramUploadPercent(progress)
+		if percent >= progress.NextLogAt || (progress.TotalBytes > 0 && progress.UploadedBytes == progress.TotalBytes) {
+			for progress.NextLogAt <= percent {
+				progress.NextLogAt += telegramUploadLogStepPercent
+			}
+			message = "Telegram 上传进度：" + telegramUploadProgressText(progress)
+		}
+	}
+	s.mu.Unlock()
+	if message != "" {
+		s.manager.addLog(identifier, "info", message)
+	}
+}
+
+func (s *telegramService) uploadProgressSnapshot(identifier string) *telegramUploadProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return nil
+	}
+	copy := *progress
+	return &copy
+}
+
+func (s *telegramService) isUploading(identifier string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, uploading := s.uploading[identifier]
+	return uploading
+}
+
+func telegramUploadPercent(progress *telegramUploadProgress) int {
+	if progress == nil || progress.TotalBytes <= 0 {
+		return 0
+	}
+	return int(progress.UploadedBytes * 100 / progress.TotalBytes)
+}
+
+func telegramUploadProgressText(progress *telegramUploadProgress) string {
+	if progress == nil || progress.TotalBytes <= 0 {
+		return "准备上传"
+	}
+	return fmt.Sprintf("%d%%（%s / %s）\n目标：Chat %d（%d/%d），文件段 %d-%d/%d", telegramUploadPercent(progress), telegramFormatBytes(progress.UploadedBytes), telegramFormatBytes(progress.TotalBytes), progress.ChatID, progress.ChatIndex, progress.ChatTotal, progress.StartPart, progress.EndPart, progress.TotalParts)
+}
+
+func telegramFormatBytes(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	value := float64(bytes)
+	for _, unit := range units {
+		value /= 1024
+		if value < 1024 || unit == "TB" {
+			return fmt.Sprintf("%.1f %s", value, unit)
+		}
+	}
+	return fmt.Sprintf("%d B", bytes)
 }
 
 func telegramMediaGroupEnd(start, total int) int {
@@ -340,7 +483,12 @@ func (s *telegramService) handleUpdate(ctx context.Context, settings telegramSet
 func (s *telegramService) handleCallback(ctx context.Context, settings telegramSettings, chatID int64, messageID int, data string) {
 	if data == "tasks" || data == "completed" {
 		s.stopTaskView(chatID, messageID)
-		s.sendTaskList(ctx, settings, chatID, data == "completed")
+		s.editTaskList(ctx, settings, chatID, messageID, data == "completed", 0)
+		return
+	}
+	if completedOnly, page, found := telegramTaskListPageCallback(data); found {
+		s.stopTaskView(chatID, messageID)
+		s.editTaskList(ctx, settings, chatID, messageID, completedOnly, page)
 		return
 	}
 	if data == "submit" {
@@ -389,32 +537,82 @@ func (s *telegramService) handleCallback(ctx context.Context, settings telegramS
 			_ = s.sendMessage(ctx, settings, chatID, err.Error(), nil)
 			return
 		}
-		_ = s.sendMessage(ctx, settings, chatID, "已开始上传，进度会写入网页任务日志。", nil)
+		s.startTaskView(settings, chatID, messageID, identifier)
 	}
 }
 
 func (s *telegramService) sendTaskList(ctx context.Context, settings telegramSettings, chatID int64, completedOnly bool) {
+	text, keyboard := s.taskListPage(completedOnly, 0)
+	_ = s.sendMessage(ctx, settings, chatID, text, keyboard)
+}
+
+func (s *telegramService) editTaskList(ctx context.Context, settings telegramSettings, chatID int64, messageID int, completedOnly bool, page int) {
+	if messageID == 0 {
+		s.sendTaskList(ctx, settings, chatID, completedOnly)
+		return
+	}
+	text, keyboard := s.taskListPage(completedOnly, page)
+	_ = s.call(ctx, settings, "editMessageText", map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "reply_markup": keyboard}, nil)
+}
+
+func (s *telegramService) taskListPage(completedOnly bool, page int) (string, telegramInlineKeyboard) {
 	items := s.manager.all()
 	sort.Slice(items, func(left, right int) bool { return items[left].CreatedAt.After(items[right].CreatedAt) })
+	filtered := make([]*task, 0, len(items))
+	for _, current := range items {
+		if !completedOnly || current.Status == statusCompleted {
+			filtered = append(filtered, current)
+		}
+	}
+	pageCount := max(1, (len(filtered)+telegramTaskListPageSize-1)/telegramTaskListPageSize)
+	page = min(max(page, 0), pageCount-1)
+	start := page * telegramTaskListPageSize
+	end := min(start+telegramTaskListPageSize, len(filtered))
 	keyboard := telegramInlineKeyboard{}
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "提交下载", CallbackData: "submit"}})
-	count := 0
-	for _, current := range items {
-		if completedOnly && current.Status != statusCompleted {
-			continue
-		}
+	for _, current := range filtered[start:end] {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: fmt.Sprintf("%s · %s", current.OutputName, telegramStatusLabel(current.Status)), CallbackData: "task:" + current.ID}})
-		count++
-		if count == 8 {
-			break
+	}
+	if pageCount > 1 {
+		mode := "all"
+		if completedOnly {
+			mode = "completed"
 		}
+		navigation := make([]telegramInlineButton, 0, 3)
+		if page > 0 {
+			navigation = append(navigation, telegramInlineButton{Text: "上一页", CallbackData: fmt.Sprintf("tasks-page:%s:%d", mode, page-1)})
+		}
+		navigation = append(navigation, telegramInlineButton{Text: fmt.Sprintf("第 %d/%d 页", page+1, pageCount), CallbackData: fmt.Sprintf("tasks-page:%s:%d", mode, page)})
+		if page+1 < pageCount {
+			navigation = append(navigation, telegramInlineButton{Text: "下一页", CallbackData: fmt.Sprintf("tasks-page:%s:%d", mode, page+1)})
+		}
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	}
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "全部任务", CallbackData: "tasks"}, {Text: "已完成", CallbackData: "completed"}})
 	message := "暂无任务"
-	if count > 0 {
-		message = "选择任务查看详情："
+	if len(filtered) > 0 {
+		message = fmt.Sprintf("选择任务查看详情（第 %d/%d 页）：", page+1, pageCount)
 	}
-	_ = s.sendMessage(ctx, settings, chatID, message, keyboard)
+	return message, keyboard
+}
+
+func telegramTaskListPageCallback(data string) (completedOnly bool, page int, found bool) {
+	parts := strings.Split(data, ":")
+	if len(parts) != 3 || parts[0] != "tasks-page" {
+		return false, 0, false
+	}
+	page, err := strconv.Atoi(parts[2])
+	if err != nil || page < 0 {
+		return false, 0, false
+	}
+	switch parts[1] {
+	case "all":
+		return false, page, true
+	case "completed":
+		return true, page, true
+	default:
+		return false, 0, false
+	}
 }
 
 func (s *telegramService) sendTaskDetails(ctx context.Context, settings telegramSettings, chatID int64, identifier string) {
@@ -423,7 +621,7 @@ func (s *telegramService) sendTaskDetails(ctx context.Context, settings telegram
 		_ = s.sendMessage(ctx, settings, chatID, "任务不存在。", nil)
 		return
 	}
-	text, keyboard := telegramTaskDetails(current)
+	text, keyboard := s.taskDetails(current)
 	var result json.RawMessage
 	if err := s.sendMessageResult(ctx, settings, chatID, text, keyboard, &result); err != nil {
 		return
@@ -434,8 +632,12 @@ func (s *telegramService) sendTaskDetails(ctx context.Context, settings telegram
 	}
 }
 
-func telegramTaskDetails(current *task) (string, telegramInlineKeyboard) {
+func (s *telegramService) taskDetails(current *task) (string, telegramInlineKeyboard) {
 	text := fmt.Sprintf("%s\n状态：%s\n%s", current.OutputName, telegramStatusLabel(current.Status), telegramTaskProgress(current))
+	progress := s.uploadProgressSnapshot(current.ID)
+	if progress != nil {
+		text += "\nTelegram 上传：" + telegramUploadProgressText(progress)
+	}
 	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "刷新", CallbackData: "refresh:" + current.ID}, {Text: "任务列表", CallbackData: "tasks"}}}}
 	if current.Status == statusRunning {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "暂停", CallbackData: "pause:" + current.ID}, {Text: "停止", CallbackData: "stop:" + current.ID}})
@@ -443,7 +645,7 @@ func telegramTaskDetails(current *task) (string, telegramInlineKeyboard) {
 	if current.Status == statusPaused {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "继续", CallbackData: "resume:" + current.ID}, {Text: "停止", CallbackData: "stop:" + current.ID}})
 	}
-	if current.Status == statusCompleted {
+	if current.Status == statusCompleted && progress == nil {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "上传视频", CallbackData: "upload:" + current.ID}})
 	}
 	return text, keyboard
@@ -454,7 +656,7 @@ func (s *telegramService) editTaskDetails(ctx context.Context, settings telegram
 	if current == nil {
 		return errors.New("任务不存在")
 	}
-	text, keyboard := telegramTaskDetails(current)
+	text, keyboard := s.taskDetails(current)
 	return s.call(ctx, settings, "editMessageText", map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "reply_markup": keyboard}, nil)
 }
 
@@ -477,7 +679,7 @@ func (s *telegramService) startTaskView(settings telegramSettings, chatID int64,
 		for {
 			_ = s.editTaskDetails(ctx, settings, chatID, messageID, identifier)
 			current := s.manager.snapshot(identifier)
-			if current == nil || current.Status == statusCompleted || current.Status == statusFailed || current.Status == statusCancelled {
+			if current == nil || ((current.Status == statusCompleted || current.Status == statusFailed || current.Status == statusCancelled) && !s.isUploading(identifier)) {
 				return
 			}
 			timer := time.NewTimer(telegramTaskRefreshInterval)
@@ -670,7 +872,7 @@ func (s *telegramService) call(ctx context.Context, settings telegramSettings, m
 	return s.sendTelegramRequest(request, result)
 }
 
-func (s *telegramService) sendFile(ctx context.Context, settings telegramSettings, method string, chatID int64, field, path, caption string) error {
+func (s *telegramService) sendFile(ctx context.Context, settings telegramSettings, method string, chatID int64, field, path, caption string, progress func(int64)) error {
 	source, err := os.Open(path)
 	if err != nil {
 		return errors.New("读取待上传文件失败")
@@ -687,7 +889,7 @@ func (s *telegramService) sendFile(ctx context.Context, settings telegramSetting
 	request.Header.Set("Content-Type", form.FormDataContentType())
 	go func() {
 		defer source.Close()
-		if err := writeTelegramFileForm(form, chatID, field, path, caption, source); err != nil {
+		if err := writeTelegramFileForm(form, chatID, field, path, caption, source, progress); err != nil {
 			_ = writer.CloseWithError(err)
 			return
 		}
@@ -697,7 +899,7 @@ func (s *telegramService) sendFile(ctx context.Context, settings telegramSetting
 	return s.sendTelegramUploadRequest(request, nil)
 }
 
-func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int) error {
+func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64)) error {
 	if len(paths) < 2 || len(paths) > telegramMediaGroupMaxItems {
 		return errors.New("Telegram 相册文件段数量必须为 2 至 10")
 	}
@@ -711,7 +913,7 @@ func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramS
 	}
 	request.Header.Set("Content-Type", form.FormDataContentType())
 	go func() {
-		if err := writeTelegramMediaGroupForm(form, chatID, paths, outputName, startIndex, totalParts); err != nil {
+		if err := writeTelegramMediaGroupForm(form, chatID, paths, outputName, startIndex, totalParts, progress); err != nil {
 			_ = writer.CloseWithError(err)
 			return
 		}
@@ -721,7 +923,7 @@ func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramS
 	return s.sendTelegramUploadRequest(request, nil)
 }
 
-func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader) error {
+func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader, progress func(int64)) error {
 	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
@@ -732,13 +934,13 @@ func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, ca
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(part, source); err != nil {
+	if _, err := io.Copy(part, telegramProgressReader{source: source, report: progress}); err != nil {
 		return err
 	}
 	return form.Close()
 }
 
-func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []string, outputName string, startIndex, totalParts int) error {
+func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64)) error {
 	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
@@ -769,7 +971,7 @@ func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []s
 		}
 		part, createErr := form.CreateFormFile(fmt.Sprintf("file%d", index), filepath.Base(path))
 		if createErr == nil {
-			_, createErr = io.Copy(part, source)
+			_, createErr = io.Copy(part, telegramProgressReader{source: source, report: progress})
 		}
 		closeErr := source.Close()
 		if createErr != nil {
@@ -780,6 +982,19 @@ func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []s
 		}
 	}
 	return form.Close()
+}
+
+type telegramProgressReader struct {
+	source io.Reader
+	report func(int64)
+}
+
+func (r telegramProgressReader) Read(buffer []byte) (int, error) {
+	count, err := r.source.Read(buffer)
+	if count > 0 && r.report != nil {
+		r.report(int64(count))
+	}
+	return count, err
 }
 
 func (s *telegramService) sendTelegramRequest(request *http.Request, result any) error {
@@ -796,7 +1011,7 @@ func (s *telegramService) sendTelegramRequestWithClient(client *http.Client, req
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return errors.New("无法连接本地 Bot API Server")
+		return telegramTransportError(err)
 	}
 	defer response.Body.Close()
 	var decoded telegramResponse
@@ -815,6 +1030,14 @@ func (s *telegramService) sendTelegramRequestWithClient(client *http.Client, req
 		}
 	}
 	return nil
+}
+
+func telegramTransportError(err error) error {
+	var requestError *url.Error
+	if errors.As(err, &requestError) && requestError.Err != nil {
+		err = requestError.Err
+	}
+	return fmt.Errorf("连接本地 Bot API Server 失败: %w", err)
 }
 
 func (s *telegramService) currentSettings() telegramSettings {
