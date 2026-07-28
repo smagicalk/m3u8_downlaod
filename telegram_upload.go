@@ -106,3 +106,123 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 	}
 	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
 }
+
+func telegramMediaBytes(paths []string) (int64, error) {
+	var total int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
+func (s *telegramService) configureUploadProgress(identifier string, totalBytes int64, chatTotal, totalParts int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return
+	}
+	progress.TotalBytes = totalBytes
+	progress.ChatTotal = chatTotal
+	progress.TotalParts = totalParts
+}
+
+func (s *telegramService) setUploadStage(identifier string, chatID int64, chatIndex, chatTotal, startPart, endPart, totalParts int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return
+	}
+	progress.ChatID = chatID
+	progress.ChatIndex = chatIndex
+	progress.ChatTotal = chatTotal
+	progress.StartPart = startPart
+	progress.EndPart = endPart
+	progress.TotalParts = totalParts
+}
+
+func (s *telegramService) recordUploadProgress(identifier string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	var message string
+	s.mu.Lock()
+	progress := s.uploadProgress[identifier]
+	if progress != nil {
+		progress.UploadedBytes += delta
+		if progress.TotalBytes > 0 && progress.UploadedBytes > progress.TotalBytes {
+			progress.UploadedBytes = progress.TotalBytes
+		}
+		percent := telegramUploadPercent(progress)
+		if percent >= progress.NextLogAt || (progress.TotalBytes > 0 && progress.UploadedBytes == progress.TotalBytes) {
+			for progress.NextLogAt <= percent {
+				progress.NextLogAt += telegramUploadLogStepPercent
+			}
+			message = "Telegram 上传进度：" + telegramUploadProgressText(progress)
+		}
+	}
+	s.mu.Unlock()
+	if message != "" {
+		s.manager.addLog(identifier, "info", message)
+	}
+}
+
+func (s *telegramService) uploadProgressSnapshot(identifier string) *telegramUploadProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	progress := s.uploadProgress[identifier]
+	if progress == nil {
+		return nil
+	}
+	copy := *progress
+	return &copy
+}
+
+func (s *telegramService) isUploading(identifier string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, uploading := s.uploading[identifier]
+	return uploading
+}
+
+func telegramUploadPercent(progress *telegramUploadProgress) int {
+	if progress == nil || progress.TotalBytes <= 0 {
+		return 0
+	}
+	return int(progress.UploadedBytes * 100 / progress.TotalBytes)
+}
+
+func telegramUploadProgressText(progress *telegramUploadProgress) string {
+	if progress == nil || progress.TotalBytes <= 0 {
+		return "准备上传"
+	}
+	return fmt.Sprintf("%d%%（%s / %s）\n目标：Chat %d（%d/%d），文件段 %d-%d/%d", telegramUploadPercent(progress), telegramFormatBytes(progress.UploadedBytes), telegramFormatBytes(progress.TotalBytes), progress.ChatID, progress.ChatIndex, progress.ChatTotal, progress.StartPart, progress.EndPart, progress.TotalParts)
+}
+
+func telegramFormatBytes(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	value := float64(bytes)
+	for _, unit := range units {
+		value /= 1024
+		if value < 1024 || unit == "TB" {
+			return fmt.Sprintf("%.1f %s", value, unit)
+		}
+	}
+	return fmt.Sprintf("%d B", bytes)
+}
+
+func telegramMediaGroupEnd(start, total int) int {
+	end := min(start+telegramMediaGroupMaxItems, total)
+	if total-end == 1 {
+		end--
+	}
+	return end
+}
