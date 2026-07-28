@@ -57,10 +57,18 @@ SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会�
 
 ## Telegram Bot
 
-需要先启动官方本地 Bot API Server，并启用 `--local`：
+下载器使用官方本地 Bot API Server 以支持本地文件路径和最高 `2000 MB` 的上传。项目提供 Windows 安装脚本；首次执行会拉取官方源码、vcpkg 与构建依赖，耗时较长并会占用较多磁盘空间：
 
 ```powershell
-telegram-bot-api --api-id "你的 API ID" --api-hash "你的 API Hash" --local
+.\scripts\install-telegram-bot-api.ps1 -InstallPrerequisites
+```
+
+安装器需要 Git、CMake 和 Visual Studio 2022 Build Tools（C++ 桌面开发工作负载）。`-InstallPrerequisites` 会通过 `winget` 安装缺失的前置条件；若刚安装 Git 或 CMake，请重新打开 PowerShell 后再次执行脚本。安装完成后的程序路径为 `tools/telegram-bot-api/telegram-bot-api.exe`。
+
+启动本地服务时必须提供你自己的 Telegram API ID 和 API Hash，并启用 `--local`：
+
+```powershell
+& '.\tools\telegram-bot-api\telegram-bot-api.exe' --api-id '你的 API ID' --api-hash '你的 API Hash' --local --http-port 8081 --dir '.\data\telegram-bot-api'
 ```
 
 默认服务地址为 `http://127.0.0.1:8081`。登录下载器后，在主页的“Telegram Bot”区域填写 Bot Token、一个或多个目标 Chat ID、自动上传选项和切分大小。多个 Chat ID 以英文逗号分隔；私聊、群组和频道均可作为发送目标。Bot 只处理已绑定 Chat ID 的 `/start`、`/tasks`、`/completed` 和内联按钮操作。

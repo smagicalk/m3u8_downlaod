@@ -36,3 +36,6 @@ downloads/
 cache/
 data/
 session.md
+tools/telegram-bot-api/
+tools/telegram-bot-api-source/
+tools/vcpkg/
