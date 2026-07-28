@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,7 +50,7 @@ func TestTelegramSettingsParseAndHideToken(t *testing.T) {
 	}
 }
 
-func TestTelegramSplitFileAndFileURI(t *testing.T) {
+func TestTelegramSplitFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "video.mp4")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
 		t.Fatal(err)
@@ -73,8 +74,46 @@ func TestTelegramSplitFileAndFileURI(t *testing.T) {
 	if joined.String() != "0123456789" {
 		t.Fatalf("joined parts = %q", joined.String())
 	}
-	if uri := telegramFileURI(path); !strings.HasPrefix(uri, "file:///") {
-		t.Fatalf("file URI = %q", uri)
+}
+
+func TestTelegramFileUploadStreamsMultipartContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "video.part001")
+	if err := os.WriteFile(path, []byte("video-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/sendDocument") {
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+		if !strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data;") {
+			t.Fatalf("content type = %q", request.Header.Get("Content-Type"))
+		}
+		if err := request.ParseMultipartForm(1024 * 1024); err != nil {
+			t.Fatal(err)
+		}
+		if request.FormValue("chat_id") != "42" || request.FormValue("caption") != "video.mp4 (1/3)" {
+			t.Fatalf("form values = %#v", request.MultipartForm.Value)
+		}
+		file, header, err := request.FormFile("document")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		content, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Filename != "video.part001" || string(content) != "video-content" {
+			t.Fatalf("uploaded file = %q, %q", header.Filename, content)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	service := &telegramService{client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+
+	if err := service.sendFile(context.Background(), settings, "sendDocument", 42, "document", path, "video.mp4 (1/3)"); err != nil {
+		t.Fatal(err)
 	}
 }
 

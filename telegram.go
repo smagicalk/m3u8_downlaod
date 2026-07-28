@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -254,8 +255,7 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 				caption = fmt.Sprintf("%s (%d/%d)", current.OutputName, index+1, len(parts))
 				method, field = "sendDocument", "document"
 			}
-			payload := map[string]any{"chat_id": chatID, field: telegramFileURI(part), "caption": caption}
-			if err := s.call(context, settings, method, payload, nil); err != nil {
+			if err := s.sendFile(context, settings, method, chatID, field, part, caption); err != nil {
 				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 上传失败（Chat %d，第 %d 段）: %v", chatID, index+1, err))
 				return
 			}
@@ -654,6 +654,54 @@ func (s *telegramService) call(ctx context.Context, settings telegramSettings, m
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	return s.sendTelegramRequest(request, result)
+}
+
+func (s *telegramService) sendFile(ctx context.Context, settings telegramSettings, method string, chatID int64, field, path, caption string) error {
+	source, err := os.Open(path)
+	if err != nil {
+		return errors.New("读取待上传文件失败")
+	}
+	reader, writer := io.Pipe()
+	form := multipart.NewWriter(writer)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(settings.APIBaseURL, "/")+"/bot"+settings.BotToken+"/"+method, reader)
+	if err != nil {
+		_ = source.Close()
+		_ = reader.Close()
+		_ = writer.Close()
+		return err
+	}
+	request.Header.Set("Content-Type", form.FormDataContentType())
+	go func() {
+		defer source.Close()
+		if err := writeTelegramFileForm(form, chatID, field, path, caption, source); err != nil {
+			_ = writer.CloseWithError(err)
+			return
+		}
+		_ = writer.Close()
+	}()
+	defer reader.Close()
+	return s.sendTelegramRequest(request, nil)
+}
+
+func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader) error {
+	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return err
+	}
+	if err := form.WriteField("caption", caption); err != nil {
+		return err
+	}
+	part, err := form.CreateFormFile(field, filepath.Base(path))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, source); err != nil {
+		return err
+	}
+	return form.Close()
+}
+
+func (s *telegramService) sendTelegramRequest(request *http.Request, result any) error {
 	response, err := s.client.Do(request)
 	if err != nil {
 		return errors.New("无法连接本地 Bot API Server")
@@ -760,15 +808,6 @@ func splitTelegramFile(path string, maxBytes int64) ([]string, func(), error) {
 		remaining -= copied
 	}
 	return parts, cleanup, nil
-}
-
-func telegramFileURI(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return path
-	}
-	pathValue := "/" + strings.TrimPrefix(filepath.ToSlash(abs), "/")
-	return (&url.URL{Scheme: "file", Path: pathValue}).String()
 }
 
 type telegramResponse struct {
