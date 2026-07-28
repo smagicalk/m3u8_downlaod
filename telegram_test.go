@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,6 +62,15 @@ func TestTelegramSegmentDurationUsesTargetSizeRatio(t *testing.T) {
 	}
 	if got := telegramSegmentDuration(1_000, 100, 1); got != 1 {
 		t.Fatalf("minimum segment duration = %f, want 1", got)
+	}
+}
+
+func TestTelegramEffectiveSplitBytesCapsSlowUploads(t *testing.T) {
+	if got := telegramEffectiveSplitBytes(1900); got != telegramStableSegmentLimitBytes {
+		t.Fatalf("effective split bytes = %d, want %d", got, telegramStableSegmentLimitBytes)
+	}
+	if got := telegramEffectiveSplitBytes(500); got != 500_000_000 {
+		t.Fatalf("effective split bytes = %d, want 500000000", got)
 	}
 }
 
@@ -180,7 +190,7 @@ func TestTelegramMediaGroupStreamsVideoAlbum(t *testing.T) {
 		if err := json.Unmarshal([]byte(request.FormValue("media")), &media); err != nil {
 			t.Fatal(err)
 		}
-		if len(media) != 2 || media[0].Type != "video" || media[0].Media != "attach://file0" || media[1].Media != "attach://file1" || media[0].Caption != "video.mp4 (1/2)" || media[1].Caption != "" {
+		if len(media) != 2 || media[0].Type != "video" || media[0].Media != "attach://file0" || media[1].Media != "attach://file1" || media[0].Caption != "" || media[1].Caption != "video.mp4 (1/2)" {
 			t.Fatalf("media = %#v", media)
 		}
 		for index, field := range []string{"file0", "file1"} {
@@ -203,7 +213,7 @@ func TestTelegramMediaGroupStreamsVideoAlbum(t *testing.T) {
 	service := &telegramService{client: server.Client()}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
-	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
+	if _, err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -225,7 +235,7 @@ func TestTelegramMediaGroupReportsUploadedMediaBytes(t *testing.T) {
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 	var uploaded atomic.Int64
 
-	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }); err != nil {
+	if _, err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }); err != nil {
 		t.Fatal(err)
 	}
 	if want := int64(len("video-content-1") + len("video-content-2")); uploaded.Load() != want {
@@ -241,7 +251,7 @@ func TestTelegramLargeMediaGroupUsesFileIDsAndDeletesStagingMessages(t *testing.
 			t.Fatal(err)
 		}
 	}
-	var videoUploads, albums, deletes atomic.Int32
+	var videoUploads, albums, deletes, waiting, confirmed atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case strings.HasSuffix(request.URL.Path, "/sendVideo"):
@@ -263,7 +273,7 @@ func TestTelegramLargeMediaGroupUsesFileIDsAndDeletesStagingMessages(t *testing.
 				t.Fatalf("album media = %#v", payload.Media)
 			}
 			albums.Add(1)
-			_, _ = writer.Write([]byte(`{"ok":true,"result":[]}`))
+			_, _ = writer.Write([]byte(`{"ok":true,"result":[{"message_id":201,"media_group_id":"album-1","video":{"file_id":"file-id-1"}},{"message_id":202,"media_group_id":"album-1","video":{"file_id":"file-id-2"}}]}`))
 		case strings.HasSuffix(request.URL.Path, "/deleteMessage"):
 			deletes.Add(1)
 			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
@@ -276,14 +286,28 @@ func TestTelegramLargeMediaGroupUsesFileIDsAndDeletesStagingMessages(t *testing.
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 	var uploaded atomic.Int64
 
-	if err := service.sendMediaGroupUsingFileIDs(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }); err != nil {
+	status := func(_ int, isConfirmed bool) {
+		if isConfirmed {
+			confirmed.Add(1)
+		} else {
+			waiting.Add(1)
+		}
+	}
+	sent, err := service.sendMediaGroupUsingFileIDs(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }, status)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(sent) != 2 || sent[0].MediaGroupID != "album-1" || sent[1].Video == nil || sent[1].Video.FileID != "file-id-2" {
+		t.Fatalf("sent album = %#v", sent)
 	}
 	if videoUploads.Load() != 2 || albums.Load() != 1 || deletes.Load() != 2 {
 		t.Fatalf("requests: videos=%d albums=%d deletes=%d", videoUploads.Load(), albums.Load(), deletes.Load())
 	}
 	if want := int64(len("video-content-1") + len("video-content-2")); uploaded.Load() != want {
 		t.Fatalf("uploaded bytes = %d, want %d", uploaded.Load(), want)
+	}
+	if waiting.Load() != 2 || confirmed.Load() != 2 {
+		t.Fatalf("staging statuses: waiting=%d confirmed=%d", waiting.Load(), confirmed.Load())
 	}
 }
 
@@ -293,6 +317,76 @@ func TestTelegramLargeMultipartAlbumRequiresFileIDStaging(t *testing.T) {
 	}
 	if !telegramMediaGroupNeedsStaging(telegramMultipartSafeLimitBytes + 1) {
 		t.Fatal("payload above safe limit must use file_id staging")
+	}
+}
+
+func TestStorePersistsTelegramAlbum(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	want := telegramAlbum{ChatID: 42, MediaGroupID: "group-1", TaskID: "task-1", OutputName: "video.mp4", Caption: "视频说明", Items: []telegramAlbumItem{{MessageID: 101, Type: "photo", FileID: "photo-1"}, {MessageID: 102, Type: "video", FileID: "video-1"}}}
+	if err := storage.saveTelegramAlbum(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := storage.loadTelegramAlbum(42, "group-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ChatID != want.ChatID || got.MediaGroupID != want.MediaGroupID || got.TaskID != want.TaskID || got.OutputName != want.OutputName || got.Caption != want.Caption || len(got.Items) != 2 || got.Items[0] != want.Items[0] || got.Items[1] != want.Items[1] {
+		t.Fatalf("stored album = %#v, want %#v", got, want)
+	}
+	if err := storage.deleteTelegramAlbum(42, "group-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := storage.loadTelegramAlbum(42, "group-1"); err != nil || got != nil {
+		t.Fatalf("deleted album = %#v, error=%v", got, err)
+	}
+}
+
+func TestStoreMigratesTelegramAlbumCaption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), databaseFileName)
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE telegram_albums (chat_id INTEGER NOT NULL, media_group_id TEXT NOT NULL, task_id TEXT NOT NULL, output_name TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (chat_id, media_group_id)); INSERT INTO telegram_albums(chat_id, media_group_id, task_id, output_name, created_at) VALUES(42, 'legacy-album', '', '旧相册说明', 1)`); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	storage, _, err := openStore(path, "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	album, err := storage.loadTelegramAlbum(42, "legacy-album")
+	if err != nil || album == nil || album.Caption != "旧相册说明" {
+		t.Fatalf("migrated album = %#v, error=%v", album, err)
+	}
+}
+
+func TestTelegramAlbumMergePlacesPhotosBeforeVideos(t *testing.T) {
+	current := []telegramAlbumItem{{Type: "photo", FileID: "old-photo"}, {Type: "video", FileID: "video-1"}, {Type: "video", FileID: "video-2"}}
+	merged, err := telegramMergeAlbumItems(current, []string{"new-photo-1", "new-photo-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []telegramAlbumItem{{Type: "photo", FileID: "old-photo"}, {Type: "photo", FileID: "new-photo-1"}, {Type: "photo", FileID: "new-photo-2"}, {Type: "video", FileID: "video-1"}, {Type: "video", FileID: "video-2"}}
+	if len(merged) != len(want) {
+		t.Fatalf("merged item count = %d, want %d", len(merged), len(want))
+	}
+	for index := range want {
+		if merged[index].Type != want[index].Type || merged[index].FileID != want[index].FileID {
+			t.Fatalf("merged[%d] = %#v, want %#v", index, merged[index], want[index])
+		}
+	}
+	tooMany := make([]string, telegramMediaGroupMaxItems-len(current)+1)
+	if _, err := telegramMergeAlbumItems(current, tooMany); err == nil {
+		t.Fatal("album with more than 10 items must be rejected")
 	}
 }
 
@@ -333,6 +427,16 @@ func TestTelegramTransportErrorPreservesCauseWithoutToken(t *testing.T) {
 	}
 }
 
+func TestTelegramTransportEOFExplainsAmbiguousUploadResult(t *testing.T) {
+	err := telegramTransportError(&url.Error{Op: "Post", URL: "http://127.0.0.1:8081/bot123:secret/sendVideo", Err: io.EOF})
+	if !strings.Contains(err.Error(), "上传结果未知") || !strings.Contains(err.Error(), "避免立即重试") {
+		t.Fatalf("EOF error must explain the ambiguous upload result: %v", err)
+	}
+	if strings.Contains(err.Error(), "123:secret") {
+		t.Fatalf("error must not contain bot token: %v", err)
+	}
+}
+
 func TestTelegramMediaGroupDoesNotUsePollTimeout(t *testing.T) {
 	directory := t.TempDir()
 	parts := []string{filepath.Join(directory, "video.part001"), filepath.Join(directory, "video.part002")}
@@ -350,8 +454,508 @@ func TestTelegramMediaGroupDoesNotUsePollTimeout(t *testing.T) {
 	service := &telegramService{client: &http.Client{Timeout: 10 * time.Millisecond}}
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
-	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
+	if _, err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2, nil); err != nil {
 		t.Fatalf("large upload must not use the poll timeout: %v", err)
+	}
+}
+
+func TestTelegramMediaGroupByItemsSendsPhotosBeforeVideos(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload struct {
+			Media []telegramInputMedia `json:"media"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Media) != 3 || payload.Media[0].Type != "photo" || payload.Media[0].Media != "photo-1" || payload.Media[0].Caption != "" || payload.Media[1].Type != "photo" || payload.Media[2].Type != "video" || payload.Media[2].Caption != "video.mp4" {
+			t.Fatalf("media payload = %#v", payload.Media)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":[{"message_id":301,"media_group_id":"new-album","photo":[{"file_id":"photo-1"}]},{"message_id":302,"media_group_id":"new-album","photo":[{"file_id":"photo-2"}]},{"message_id":303,"media_group_id":"new-album","video":{"file_id":"video-1"}}]}`))
+	}))
+	defer server.Close()
+	service := &telegramService{client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+	items := []telegramAlbumItem{{Type: "photo", FileID: "photo-1"}, {Type: "photo", FileID: "photo-2"}, {Type: "video", FileID: "video-1"}}
+	sent, err := service.sendMediaGroupByItems(context.Background(), settings, 42, items, "video.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 3 || sent[0].MediaGroupID != "new-album" {
+		t.Fatalf("sent messages = %#v", sent)
+	}
+}
+
+func TestTelegramAlbumPhotoConfirmationRebuildsAndReplacesAlbum(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	oldAlbum := telegramAlbum{ChatID: 42, MediaGroupID: "old-album", TaskID: "task-1", OutputName: "video.mp4", Caption: "原说明", Items: []telegramAlbumItem{{MessageID: 101, Type: "video", FileID: "video-1"}, {MessageID: 102, Type: "video", FileID: "video-2"}}}
+	if err := storage.saveTelegramAlbum(oldAlbum); err != nil {
+		t.Fatal(err)
+	}
+	confirmation := make(chan string, 1)
+	albumPayload := make(chan []telegramInputMedia, 1)
+	deleted := make(chan int, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/sendMessage"):
+			var payload struct {
+				ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range payload.ReplyMarkup.InlineKeyboard {
+				for _, button := range row {
+					if strings.HasPrefix(button.CallbackData, "album-add-confirm:") {
+						confirmation <- button.CallbackData
+					}
+				}
+			}
+			_, _ = writer.Write([]byte(`{"ok":true,"result":{"message_id":900,"chat":{"id":42}}}`))
+		case strings.HasSuffix(request.URL.Path, "/sendMediaGroup"):
+			var payload struct {
+				Media []telegramInputMedia `json:"media"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			albumPayload <- payload.Media
+			_, _ = writer.Write([]byte(`{"ok":true,"result":[{"message_id":201,"media_group_id":"new-album","photo":[{"file_id":"photo-1","width":100,"height":100}]},{"message_id":202,"media_group_id":"new-album","photo":[{"file_id":"photo-2","width":100,"height":100}]},{"message_id":203,"media_group_id":"new-album","video":{"file_id":"video-1"}},{"message_id":204,"media_group_id":"new-album","video":{"file_id":"video-2"}}]}`))
+		case strings.HasSuffix(request.URL.Path, "/deleteMessage"):
+			var payload struct {
+				MessageID int `json:"message_id"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			deleted <- payload.MessageID
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(request.URL.Path, "/answerCallbackQuery"):
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"):
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	service := &telegramService{store: storage, client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 500, Chat: telegramChat{ID: 42}, Text: "/add", ReplyToMessage: &telegramMessage{MessageID: 101, MediaGroupID: "old-album"}}})
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 501, MediaGroupID: "incoming-photos", Chat: telegramChat{ID: 42}, Photo: []telegramPhotoSize{{FileID: "photo-1", Width: 100, Height: 100}}}})
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 502, MediaGroupID: "incoming-photos", Chat: telegramChat{ID: 42}, Photo: []telegramPhotoSize{{FileID: "photo-2", Width: 100, Height: 100}}}})
+	var callbackData string
+	select {
+	case callbackData = <-confirmation:
+	case <-time.After(3 * time.Second):
+		t.Fatal("confirmation button was not sent")
+	}
+	service.handleCallback(context.Background(), settings, 42, 900, callbackData)
+	select {
+	case media := <-albumPayload:
+		if len(media) != 4 || media[0].Type != "photo" || media[0].Media != "photo-1" || media[1].Type != "photo" || media[1].Media != "photo-2" || media[2].Type != "video" || media[3].Media != "video-2" {
+			t.Fatalf("replacement media = %#v", media)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement album was not sent")
+	}
+	newAlbum, err := storage.loadTelegramAlbum(42, "new-album")
+	if err != nil || newAlbum == nil || len(newAlbum.Items) != 4 {
+		t.Fatalf("new album = %#v, error=%v", newAlbum, err)
+	}
+	if old, err := storage.loadTelegramAlbum(42, "old-album"); err != nil || old != nil {
+		t.Fatalf("old album = %#v, error=%v", old, err)
+	}
+	wantDeleted := map[int]bool{101: true, 102: true, 501: true, 502: true, 900: true}
+	for index := 0; index < 5; index++ {
+		select {
+		case messageID := <-deleted:
+			delete(wantDeleted, messageID)
+		case <-time.After(time.Second):
+			t.Fatalf("messages were not deleted: %#v", wantDeleted)
+		}
+	}
+	if len(wantDeleted) != 0 {
+		t.Fatalf("messages were not deleted: %#v", wantDeleted)
+	}
+}
+
+func TestTelegramAlbumCaptionEditRequiresAddSession(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	album := telegramAlbum{ChatID: 42, MediaGroupID: "old-album", OutputName: "video.mp4", Caption: "原说明", Items: []telegramAlbumItem{{MessageID: 101, Type: "video", FileID: "video-1"}, {MessageID: 102, Type: "video", FileID: "video-2"}}}
+	if err := storage.saveTelegramAlbum(album); err != nil {
+		t.Fatal(err)
+	}
+	type sentMessage struct {
+		Text        string                 `json:"text"`
+		ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+	}
+	messages := make(chan sentMessage, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/sendMessage") {
+			t.Errorf("unexpected method path: %s", request.URL.Path)
+			return
+		}
+		var payload sentMessage
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		messages <- payload
+		_, _ = writer.Write([]byte(`{"ok":true,"result":{"message_id":900,"chat":{"id":42}}}`))
+	}))
+	defer server.Close()
+	service := &telegramService{store: storage, client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 700, Chat: telegramChat{ID: 42}, Text: "/add", ReplyToMessage: &telegramMessage{MessageID: 101, MediaGroupID: "old-album"}}})
+	select {
+	case prompt := <-messages:
+		if !strings.Contains(prompt.Text, "图片") || !strings.Contains(prompt.Text, "说明文字") {
+			t.Fatalf("edit prompt = %q", prompt.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("/add did not start an album edit session")
+	}
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 701, Chat: telegramChat{ID: 42}, Text: "新的统一说明"}})
+	select {
+	case confirmation := <-messages:
+		if !strings.Contains(confirmation.Text, "新的统一说明") || !telegramKeyboardHasPrefix(confirmation.ReplyMarkup, "album-add-confirm:") {
+			t.Fatalf("caption confirmation = %#v", confirmation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caption edit confirmation was not sent")
+	}
+}
+
+func TestTelegramAlbumCaptionConfirmationRebuildsWithCaptionOnLastItem(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	oldAlbum := telegramAlbum{ChatID: 42, MediaGroupID: "old-album", OutputName: "video.mp4", Caption: "原说明", Items: []telegramAlbumItem{{MessageID: 101, Type: "video", FileID: "video-1"}, {MessageID: 102, Type: "video", FileID: "video-2"}}}
+	if err := storage.saveTelegramAlbum(oldAlbum); err != nil {
+		t.Fatal(err)
+	}
+	mediaPayload := make(chan []telegramInputMedia, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"), strings.HasSuffix(request.URL.Path, "/deleteMessage"):
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(request.URL.Path, "/sendMediaGroup"):
+			var payload struct {
+				Media []telegramInputMedia `json:"media"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			mediaPayload <- payload.Media
+			_, _ = writer.Write([]byte(`{"ok":true,"result":[{"message_id":201,"media_group_id":"new-album","video":{"file_id":"video-1"}},{"message_id":202,"media_group_id":"new-album","video":{"file_id":"video-2"}}]}`))
+		default:
+			t.Errorf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	addition := &telegramAlbumAddition{Token: "token", ChatID: 42, TargetMediaGroupID: "old-album", Caption: "新的统一说明", UpdateCaption: true, SourceMessageIDs: []int{701}}
+	service := &telegramService{store: storage, client: server.Client(), albumAdditions: map[string]*telegramAlbumAddition{"token": addition}}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+
+	service.confirmAlbumAddition(context.Background(), settings, 42, 900, "token")
+	select {
+	case media := <-mediaPayload:
+		if len(media) != 2 || media[0].Caption != "" || media[1].Caption != "新的统一说明" {
+			t.Fatalf("replacement media = %#v", media)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement album was not sent")
+	}
+	newAlbum, err := storage.loadTelegramAlbum(42, "new-album")
+	if err != nil || newAlbum == nil || newAlbum.Caption != "新的统一说明" {
+		t.Fatalf("new album = %#v, error=%v", newAlbum, err)
+	}
+	if old, err := storage.loadTelegramAlbum(42, "old-album"); err != nil || old != nil {
+		t.Fatalf("old album = %#v, error=%v", old, err)
+	}
+}
+
+func TestTelegramAlbumPhotoCancellationKeepsOriginalMessages(t *testing.T) {
+	edited := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/editMessageText") {
+			t.Fatalf("cancel must not call %s", request.URL.Path)
+		}
+		var payload struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		edited <- payload.Text
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	service := &telegramService{client: server.Client(), albumAdditions: map[string]*telegramAlbumAddition{"token": {Token: "token", ChatID: 42, TargetMediaGroupID: "old-album", PhotoFileIDs: []string{"photo-1"}, SourceMessageIDs: []int{501}}}}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+	service.handleCallback(context.Background(), settings, 42, 900, "album-add-cancel:token")
+	select {
+	case text := <-edited:
+		if text != "已取消添加图片。" {
+			t.Fatalf("cancel text = %q", text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel confirmation was not edited")
+	}
+	if service.takeAlbumAddition("token", 42) != nil {
+		t.Fatal("cancelled addition must be removed")
+	}
+}
+
+func TestTelegramCallbackDoesNotWaitForAcknowledgement(t *testing.T) {
+	acknowledgementStarted := make(chan struct{}, 1)
+	releaseAcknowledgement := make(chan struct{})
+	edited := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/answerCallbackQuery"):
+			acknowledgementStarted <- struct{}{}
+			<-releaseAcknowledgement
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"):
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			edited <- payload.Text
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Errorf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	defer close(releaseAcknowledgement)
+	service := &telegramService{client: server.Client(), albumAdditions: map[string]*telegramAlbumAddition{"token": {Token: "token", ChatID: 42}}}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+	done := make(chan struct{})
+	go func() {
+		service.handleUpdate(context.Background(), settings, telegramUpdate{CallbackQuery: &telegramCallbackQuery{ID: "callback-1", Data: "album-add-cancel:token", Message: &telegramMessage{MessageID: 900, Chat: telegramChat{ID: 42}}}})
+		close(done)
+	}()
+	select {
+	case <-acknowledgementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("callback acknowledgement was not started")
+	}
+	select {
+	case text := <-edited:
+		if text != "已取消添加图片。" {
+			t.Fatalf("callback result text = %q", text)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("callback processing waited for answerCallbackQuery")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("callback processing did not finish")
+	}
+}
+
+func TestTelegramAlbumImportConfirmationCanRetryAfterNotificationFailure(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	var editRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"):
+			requestNumber := editRequests.Add(1)
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			if requestNumber == 1 {
+				_, _ = writer.Write([]byte(`{"ok":false,"description":"temporary edit failure"}`))
+				return
+			}
+			if !strings.Contains(payload.Text, "已导入 2 个视频") {
+				t.Errorf("retry result text = %q", payload.Text)
+			}
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(request.URL.Path, "/sendMessage"):
+			_, _ = writer.Write([]byte(`{"ok":false,"description":"temporary send failure"}`))
+		default:
+			t.Errorf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	pending := &telegramAlbumImport{Token: "token", Album: telegramAlbum{ChatID: 42, MediaGroupID: "forwarded-album", OutputName: "video.mp4", Items: []telegramAlbumItem{{MessageID: 601, Type: "video", FileID: "video-1"}, {MessageID: 602, Type: "video", FileID: "video-2"}}}}
+	service := &telegramService{store: storage, client: server.Client(), albumImportConfirmations: map[string]*telegramAlbumImport{"token": pending}}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+
+	service.confirmAlbumImport(context.Background(), settings, 42, 950, "token")
+	service.confirmAlbumImport(context.Background(), settings, 42, 950, "token")
+
+	if editRequests.Load() != 2 {
+		t.Fatalf("edit requests = %d, want 2", editRequests.Load())
+	}
+	album, err := storage.loadTelegramAlbum(42, "forwarded-album")
+	if err != nil || album == nil || len(album.Items) != 2 {
+		t.Fatalf("imported album = %#v, error=%v", album, err)
+	}
+}
+
+func TestTelegramForwardedAlbumConfirmationImportsSQLite(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	confirmation := make(chan string, 1)
+	additionConfirmation := make(chan string, 1)
+	edited := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/sendMessage"):
+			var payload struct {
+				ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range payload.ReplyMarkup.InlineKeyboard {
+				for _, button := range row {
+					if strings.HasPrefix(button.CallbackData, "album-import-confirm:") {
+						confirmation <- button.CallbackData
+					}
+					if strings.HasPrefix(button.CallbackData, "album-add-confirm:") {
+						additionConfirmation <- button.CallbackData
+					}
+				}
+			}
+			_, _ = writer.Write([]byte(`{"ok":true,"result":{"message_id":950,"chat":{"id":42}}}`))
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"):
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			edited <- payload.Text
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	service := &telegramService{store: storage, client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+	service.handleCallback(context.Background(), settings, 42, 940, "album-import")
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 601, MediaGroupID: "forwarded-album", Chat: telegramChat{ID: 42}, Caption: "video.mp4 (1/2)", Video: &telegramVideo{FileID: "video-1"}}})
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 602, MediaGroupID: "forwarded-album", Chat: telegramChat{ID: 42}, Video: &telegramVideo{FileID: "video-2"}}})
+	var callbackData string
+	select {
+	case callbackData = <-confirmation:
+	case <-time.After(3 * time.Second):
+		t.Fatal("import confirmation button was not sent")
+	}
+	service.handleCallback(context.Background(), settings, 42, 950, callbackData)
+	select {
+	case text := <-edited:
+		if !strings.Contains(text, "已导入 2 个视频") {
+			t.Fatalf("import result text = %q", text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("import confirmation was not updated")
+	}
+	album, err := storage.loadTelegramAlbum(42, "forwarded-album")
+	if err != nil || album == nil {
+		t.Fatalf("imported album = %#v, error=%v", album, err)
+	}
+	if album.OutputName != "video.mp4" || len(album.Items) != 2 || album.Items[0].MessageID != 601 || album.Items[0].FileID != "video-1" || album.Items[1].MessageID != 602 || album.Items[1].FileID != "video-2" {
+		t.Fatalf("imported album = %#v", album)
+	}
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 603, Chat: telegramChat{ID: 42}, Text: "/add", ReplyToMessage: &telegramMessage{MessageID: 601, MediaGroupID: "forwarded-album"}}})
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{MessageID: 604, Chat: telegramChat{ID: 42}, Photo: []telegramPhotoSize{{FileID: "photo-1", Width: 100, Height: 100}}}})
+	select {
+	case <-additionConfirmation:
+	case <-time.After(3 * time.Second):
+		t.Fatal("imported album did not enter the photo confirmation flow")
+	}
+}
+
+func TestTelegramAlbumImportRequiresExplicitModeAndCanBeCancelled(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	prompted := make(chan telegramInlineKeyboard, 1)
+	edited := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/sendMessage"):
+			var payload struct {
+				ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			prompted <- payload.ReplyMarkup
+			_, _ = writer.Write([]byte(`{"ok":true,"result":{"message_id":940,"chat":{"id":42}}}`))
+		case strings.HasSuffix(request.URL.Path, "/editMessageText"):
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			edited <- payload.Text
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Errorf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	service := &telegramService{store: storage, client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}}
+	video := &telegramMessage{MessageID: 601, MediaGroupID: "forwarded-album", Chat: telegramChat{ID: 42}, Video: &telegramVideo{FileID: "video-1"}}
+
+	if service.handleAlbumImportMessage(context.Background(), settings, video) {
+		t.Fatal("video album must be ignored until import mode is enabled")
+	}
+	service.handleCallback(context.Background(), settings, 42, 900, "album-import")
+	select {
+	case keyboard := <-prompted:
+		if !telegramKeyboardHasCallback(keyboard, "album-import-mode-cancel") {
+			t.Fatal("album import prompt must include a cancel button")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("album import prompt was not sent")
+	}
+	service.handleCallback(context.Background(), settings, 42, 940, "album-import-mode-cancel")
+	select {
+	case text := <-edited:
+		if text != "已取消导入相册。" {
+			t.Fatalf("cancel result text = %q", text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("album import cancellation was not acknowledged")
+	}
+	if service.handleAlbumImportMessage(context.Background(), settings, video) {
+		t.Fatal("video album must be ignored after import mode is cancelled")
 	}
 }
 
@@ -418,8 +1022,8 @@ func TestTelegramSubmissionPromptAndTaskControls(t *testing.T) {
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}, SplitSizeMB: 1900}
 
 	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{Chat: telegramChat{ID: 42}, Text: "/start"}})
-	if len(messages) != 1 || !telegramKeyboardHasCallback(messages[0].ReplyMarkup, "submit") {
-		t.Fatal("Telegram menu must include a submit button")
+	if len(messages) != 1 || !telegramKeyboardHasCallback(messages[0].ReplyMarkup, "submit") || !telegramKeyboardHasCallback(messages[0].ReplyMarkup, "album-import") {
+		t.Fatal("Telegram menu must include submit and album import buttons")
 	}
 	service.handleCallback(context.Background(), settings, 42, 0, "submit")
 	if !service.awaitingSubmission(42) {
@@ -499,6 +1103,17 @@ func telegramKeyboardHasCallback(keyboard telegramInlineKeyboard, callback strin
 	for _, row := range keyboard.InlineKeyboard {
 		for _, button := range row {
 			if button.CallbackData == callback {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func telegramKeyboardHasPrefix(keyboard telegramInlineKeyboard, prefix string) bool {
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if strings.HasPrefix(button.CallbackData, prefix) {
 				return true
 			}
 		}

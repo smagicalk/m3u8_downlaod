@@ -104,6 +104,19 @@ func registerTaskRoutes(mux *http.ServeMux, manager *taskManager, telegram *tele
 		}
 		writeJSON(writer, http.StatusOK, directorySelectionResponse{Path: selected})
 	})
+	mux.HandleFunc("POST /api/files/ffmpeg/select", func(writer http.ResponseWriter, request *http.Request) {
+		var payload fileSelectionRequest
+		if err := decodeJSONBody(writer, request, 4*1024, &payload); err != nil {
+			writeError(writer, http.StatusBadRequest, "请求内容无效")
+			return
+		}
+		selected, err := selectFFmpegExecutable(payload.InitialPath)
+		if err != nil {
+			writeError(writer, http.StatusInternalServerError, "无法打开 FFmpeg 文件选择器")
+			return
+		}
+		writeJSON(writer, http.StatusOK, directorySelectionResponse{Path: selected})
+	})
 	mux.HandleFunc("GET /api/health", func(writer http.ResponseWriter, request *http.Request) {
 		_, err := exec.LookPath(ffmpegExecutable())
 		writeJSON(writer, http.StatusOK, map[string]bool{"ffmpegAvailable": err == nil})

@@ -37,13 +37,19 @@ type telegramService struct {
 	client       *http.Client
 	uploadClient *http.Client
 
-	mu             sync.RWMutex
-	settings       telegramSettings
-	cancel         context.CancelFunc
-	uploading      map[string]struct{}
-	uploadProgress map[string]*telegramUploadProgress
-	submissions    map[int64]*telegramSubmission
-	views          map[telegramTaskView]*telegramTaskSubscription
+	mu                       sync.RWMutex
+	settings                 telegramSettings
+	cancel                   context.CancelFunc
+	uploading                map[string]struct{}
+	uploadProgress           map[string]*telegramUploadProgress
+	submissions              map[int64]*telegramSubmission
+	views                    map[telegramTaskView]*telegramTaskSubscription
+	albumCollections         map[string]*telegramAlbumCollection
+	albumAdditions           map[string]*telegramAlbumAddition
+	albumImports             map[string]*telegramAlbumImportCollection
+	albumImportConfirmations map[string]*telegramAlbumImport
+	albumImportModes         map[int64]struct{}
+	albumEdits               map[int64]*telegramAlbumEditSession
 }
 
 func newTelegramService(storage *store, manager *taskManager) (*telegramService, error) {
@@ -51,7 +57,7 @@ func newTelegramService(storage *store, manager *taskManager) (*telegramService,
 	if err != nil {
 		return nil, err
 	}
-	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, uploadClient: &http.Client{}, settings: settings, uploading: make(map[string]struct{}), uploadProgress: make(map[string]*telegramUploadProgress), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription)}, nil
+	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, uploadClient: &http.Client{}, settings: settings, uploading: make(map[string]struct{}), uploadProgress: make(map[string]*telegramUploadProgress), submissions: make(map[int64]*telegramSubmission), views: make(map[telegramTaskView]*telegramTaskSubscription), albumCollections: make(map[string]*telegramAlbumCollection), albumAdditions: make(map[string]*telegramAlbumAddition), albumImports: make(map[string]*telegramAlbumImportCollection), albumImportConfirmations: make(map[string]*telegramAlbumImport), albumImportModes: make(map[int64]struct{}), albumEdits: make(map[int64]*telegramAlbumEditSession)}, nil
 }
 
 func (s *telegramService) start() {
@@ -80,7 +86,23 @@ func (s *telegramService) stop() {
 	for _, subscription := range s.views {
 		subscription.cancel()
 	}
+	for _, collection := range s.albumCollections {
+		if collection.Timer != nil {
+			collection.Timer.Stop()
+		}
+	}
+	for _, collection := range s.albumImports {
+		if collection.Timer != nil {
+			collection.Timer.Stop()
+		}
+	}
 	s.views = make(map[telegramTaskView]*telegramTaskSubscription)
+	s.albumCollections = make(map[string]*telegramAlbumCollection)
+	s.albumAdditions = make(map[string]*telegramAlbumAddition)
+	s.albumImports = make(map[string]*telegramAlbumImportCollection)
+	s.albumImportConfirmations = make(map[string]*telegramAlbumImport)
+	s.albumImportModes = make(map[int64]struct{})
+	s.albumEdits = make(map[int64]*telegramAlbumEditSession)
 	s.mu.Unlock()
 }
 

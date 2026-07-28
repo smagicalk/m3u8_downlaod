@@ -95,13 +95,45 @@ func hlsInputOptions(sourceURL string, concurrentDownloads bool) []string {
 }
 
 func ffmpegExecutable() string {
-	if configured := strings.TrimSpace(ffmpegPathOverride); configured != "" {
+	if configured := configuredFFmpegPath(); configured != "" {
 		return configured
 	}
 	if configured := strings.TrimSpace(os.Getenv("FFMPEG_PATH")); configured != "" {
 		return configured
 	}
 	return "ffmpeg"
+}
+
+func normalizeFFmpegPath(raw string) (string, error) {
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" {
+		return "", nil
+	}
+	info, err := os.Stat(candidate)
+	if err == nil && info.IsDir() {
+		name := "ffmpeg"
+		if strings.EqualFold(filepath.Ext(ffmpegExecutable()), ".exe") || filepath.Separator == '\\' {
+			name = "ffmpeg.exe"
+		}
+		candidate = filepath.Join(candidate, name)
+		info, err = os.Stat(candidate)
+	}
+	if err != nil {
+		resolved, lookupErr := exec.LookPath(candidate)
+		if lookupErr != nil {
+			return "", errors.New("FFmpeg 路径无效，未找到可执行文件")
+		}
+		candidate = resolved
+		info, err = os.Stat(candidate)
+	}
+	if err != nil || info.IsDir() {
+		return "", errors.New("FFmpeg 路径必须指向可执行文件或其所在目录")
+	}
+	absolute, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", errors.New("无法解析 FFmpeg 路径")
+	}
+	return absolute, nil
 }
 
 func readProgress(reader io.Reader, onProgress func(float64)) {

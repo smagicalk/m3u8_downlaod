@@ -23,7 +23,7 @@ type telegramResponse struct {
 	Result      json.RawMessage `json:"result"`
 }
 
-type telegramInputMediaVideo struct {
+type telegramInputMedia struct {
 	Type    string `json:"type"`
 	Media   string `json:"media"`
 	Caption string `json:"caption,omitempty"`
@@ -95,9 +95,9 @@ func (s *telegramService) sendFileResult(ctx context.Context, settings telegramS
 	return s.sendTelegramUploadRequest(request, result)
 }
 
-func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64)) error {
+func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64)) ([]telegramMessage, error) {
 	if len(paths) < 2 || len(paths) > telegramMediaGroupMaxItems {
-		return errors.New("Telegram 相册文件段数量必须为 2 至 10")
+		return nil, errors.New("Telegram 相册文件段数量必须为 2 至 10")
 	}
 	reader, writer := io.Pipe()
 	form := multipart.NewWriter(writer)
@@ -105,7 +105,7 @@ func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramS
 	if err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
-		return err
+		return nil, err
 	}
 	request.Header.Set("Content-Type", form.FormDataContentType())
 	go func() {
@@ -116,12 +116,16 @@ func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramS
 		_ = writer.Close()
 	}()
 	defer reader.Close()
-	return s.sendTelegramUploadRequest(request, nil)
+	var sent []telegramMessage
+	if err := s.sendTelegramUploadRequest(request, &sent); err != nil {
+		return nil, err
+	}
+	return sent, nil
 }
 
-func (s *telegramService) sendMediaGroupUsingFileIDs(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64)) error {
+func (s *telegramService) sendMediaGroupUsingFileIDs(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int, progress func(int64), status func(int, bool)) ([]telegramMessage, error) {
 	if len(paths) < 2 || len(paths) > telegramMediaGroupMaxItems {
-		return errors.New("Telegram 相册文件段数量必须为 2 至 10")
+		return nil, errors.New("Telegram 相册文件段数量必须为 2 至 10")
 	}
 	staged := make([]telegramSentVideo, 0, len(paths))
 	defer func() {
@@ -131,30 +135,78 @@ func (s *telegramService) sendMediaGroupUsingFileIDs(ctx context.Context, settin
 	}()
 	fileIDs := make([]string, 0, len(paths))
 	for index, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, errors.New("读取待上传文件失败")
+		}
+		partNumber := startIndex + index
+		var transmitted int64
+		waitingReported := false
+		partProgress := func(delta int64) {
+			if progress != nil {
+				progress(delta)
+			}
+			transmitted += delta
+			if !waitingReported && transmitted >= info.Size() {
+				waitingReported = true
+				if status != nil {
+					status(partNumber, false)
+				}
+			}
+		}
 		var sent telegramSentVideo
-		caption := fmt.Sprintf("%s (%d/%d)", outputName, startIndex+index, totalParts)
-		if err := s.sendFileResult(ctx, settings, "sendVideo", chatID, "video", path, caption, progress, &sent); err != nil {
-			return err
+		caption := fmt.Sprintf("%s (%d/%d)", outputName, partNumber, totalParts)
+		if err := s.sendFileResult(ctx, settings, "sendVideo", chatID, "video", path, caption, partProgress, &sent); err != nil {
+			return nil, err
 		}
 		if sent.MessageID == 0 || sent.Video.FileID == "" {
-			return errors.New("Bot API 未返回暂存视频的 file_id")
+			return nil, errors.New("Bot API 未返回暂存视频的 file_id")
 		}
 		staged = append(staged, sent)
 		fileIDs = append(fileIDs, sent.Video.FileID)
+		if status != nil {
+			status(partNumber, true)
+		}
 	}
 	return s.sendMediaGroupByFileIDs(ctx, settings, chatID, fileIDs, outputName, startIndex, totalParts)
 }
 
-func (s *telegramService) sendMediaGroupByFileIDs(ctx context.Context, settings telegramSettings, chatID int64, fileIDs []string, outputName string, startIndex, totalParts int) error {
-	media := make([]telegramInputMediaVideo, 0, len(fileIDs))
+func (s *telegramService) sendMediaGroupByFileIDs(ctx context.Context, settings telegramSettings, chatID int64, fileIDs []string, outputName string, startIndex, totalParts int) ([]telegramMessage, error) {
+	media := make([]telegramInputMedia, 0, len(fileIDs))
 	for index, fileID := range fileIDs {
-		item := telegramInputMediaVideo{Type: "video", Media: fileID}
-		if index == 0 {
+		item := telegramInputMedia{Type: "video", Media: fileID}
+		if index == len(fileIDs)-1 {
 			item.Caption = fmt.Sprintf("%s (%d/%d)", outputName, startIndex, totalParts)
 		}
 		media = append(media, item)
 	}
-	return s.call(ctx, settings, "sendMediaGroup", map[string]any{"chat_id": chatID, "media": media}, nil)
+	var sent []telegramMessage
+	if err := s.call(ctx, settings, "sendMediaGroup", map[string]any{"chat_id": chatID, "media": media}, &sent); err != nil {
+		return nil, err
+	}
+	return sent, nil
+}
+
+func (s *telegramService) sendMediaGroupByItems(ctx context.Context, settings telegramSettings, chatID int64, items []telegramAlbumItem, caption string) ([]telegramMessage, error) {
+	if len(items) < 2 || len(items) > telegramMediaGroupMaxItems {
+		return nil, errors.New("Telegram 相册媒体数量必须为 2 至 10")
+	}
+	media := make([]telegramInputMedia, 0, len(items))
+	for index, source := range items {
+		if (source.Type != "photo" && source.Type != "video") || source.FileID == "" {
+			return nil, errors.New("Telegram 相册媒体数据无效")
+		}
+		item := telegramInputMedia{Type: source.Type, Media: source.FileID}
+		if index == len(items)-1 {
+			item.Caption = caption
+		}
+		media = append(media, item)
+	}
+	var sent []telegramMessage
+	if err := s.call(ctx, settings, "sendMediaGroup", map[string]any{"chat_id": chatID, "media": media}, &sent); err != nil {
+		return nil, err
+	}
+	return sent, nil
 }
 
 func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader, progress func(int64)) error {
@@ -178,10 +230,10 @@ func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []s
 	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
-	media := make([]telegramInputMediaVideo, 0, len(paths))
+	media := make([]telegramInputMedia, 0, len(paths))
 	for index := range paths {
-		item := telegramInputMediaVideo{Type: "video", Media: fmt.Sprintf("attach://file%d", index)}
-		if index == 0 {
+		item := telegramInputMedia{Type: "video", Media: fmt.Sprintf("attach://file%d", index)}
+		if index == len(paths)-1 {
 			item.Caption = fmt.Sprintf("%s (%d/%d)", outputName, startIndex, totalParts)
 		}
 		media = append(media, item)
@@ -265,6 +317,9 @@ func telegramTransportError(err error) error {
 	var requestError *url.Error
 	if errors.As(err, &requestError) && requestError.Err != nil {
 		err = requestError.Err
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("本地 Bot API Server 在返回确认前断开连接，上传结果未知（Telegram 可能仍在后台完成），请先检查目标会话并避免立即重试: %w", err)
 	}
 	return fmt.Errorf("连接本地 Bot API Server 失败: %w", err)
 }

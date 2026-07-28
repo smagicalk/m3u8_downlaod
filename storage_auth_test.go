@@ -19,7 +19,7 @@ func TestStorePersistsSettingsTaskAndLogs(t *testing.T) {
 	if generatedPassword != "" {
 		t.Fatal("explicit initial password must not be replaced")
 	}
-	settings := appSettings{OutputDir: filepath.Join(t.TempDir(), "downloads"), CacheDir: filepath.Join(t.TempDir(), "cache"), DeleteCache: false, WorkerCount: 4}
+	settings := appSettings{OutputDir: filepath.Join(t.TempDir(), "downloads"), CacheDir: filepath.Join(t.TempDir(), "cache"), FFmpegPath: "H:/video/ffmpeg.exe", DeleteCache: false, WorkerCount: 4}
 	if err := storage.saveSettings(settings); err != nil {
 		t.Fatal(err)
 	}

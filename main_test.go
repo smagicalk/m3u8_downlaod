@@ -171,6 +171,44 @@ func TestFFmpegExecutableUsesFlagOverride(t *testing.T) {
 	}
 }
 
+func TestNormalizeFFmpegPathAcceptsExecutableDirectory(t *testing.T) {
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "ffmpeg.exe")
+	if err := os.WriteFile(executable, []byte("test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeFFmpegPath(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != executable {
+		t.Fatalf("normalized FFmpeg path = %q, want %q", got, executable)
+	}
+}
+
+func TestUpdateSettingsActivatesFFmpegPath(t *testing.T) {
+	previous := configuredFFmpegPath()
+	t.Cleanup(func() { setConfiguredFFmpegPath(previous) })
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "ffmpeg.exe")
+	if err := os.WriteFile(executable, []byte("test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTaskManagerWithStore(appSettings{OutputDir: directory, CacheDir: directory, WorkerCount: 4}, nil)
+	settings := manager.settings()
+	settings.FFmpegPath = executable
+	if err := manager.updateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := ffmpegExecutable(); got != executable {
+		t.Fatalf("active FFmpeg path = %q, want %q", got, executable)
+	}
+	settings.FFmpegPath = filepath.Join(directory, "missing.exe")
+	if err := manager.updateSettings(settings); err == nil {
+		t.Fatal("missing FFmpeg executable must be rejected")
+	}
+}
+
 func TestNormalizeOutputName(t *testing.T) {
 	tests := []struct {
 		input string

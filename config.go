@@ -1,6 +1,10 @@
 package main
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+	"sync"
+)
 
 const (
 	defaultAddress  = "127.0.0.1:8080"
@@ -13,5 +17,18 @@ const (
 
 var (
 	ffmpegPathOverride string
+	ffmpegPathMu       sync.RWMutex
 	playlistURI        = regexp.MustCompile(`URI="([^"]+)"`)
 )
+
+func configuredFFmpegPath() string {
+	ffmpegPathMu.RLock()
+	defer ffmpegPathMu.RUnlock()
+	return strings.TrimSpace(ffmpegPathOverride)
+}
+
+func setConfiguredFFmpegPath(path string) {
+	ffmpegPathMu.Lock()
+	ffmpegPathOverride = strings.TrimSpace(path)
+	ffmpegPathMu.Unlock()
+}

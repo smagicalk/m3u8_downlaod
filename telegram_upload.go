@@ -8,7 +8,8 @@ import (
 )
 
 const telegramUploadLogStepPercent = 5
-const telegramMultipartSafeLimitBytes int64 = 3_900_000_000
+const telegramStableSegmentLimitBytes int64 = 900_000_000
+const telegramMultipartSafeLimitBytes int64 = telegramStableSegmentLimitBytes
 
 type telegramUploadProgress struct {
 	TotalBytes    int64
@@ -70,7 +71,12 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 	if current == nil {
 		return
 	}
-	parts, cleanup, err := splitTelegramVideo(current.OutputPath, int64(settings.SplitSizeMB)*1_000_000, current.DurationSec)
+	configuredSplitBytes := int64(settings.SplitSizeMB) * 1_000_000
+	effectiveSplitBytes := telegramEffectiveSplitBytes(settings.SplitSizeMB)
+	if effectiveSplitBytes < configuredSplitBytes {
+		s.manager.addLog(identifier, "info", fmt.Sprintf("Telegram 分段配置为 %d MB；为避免大文件上传完成后 HTTP 响应中断，本次按 %d MB 稳定上限切分", settings.SplitSizeMB, telegramStableSegmentLimitBytes/1_000_000))
+	}
+	parts, cleanup, err := splitTelegramVideo(current.OutputPath, effectiveSplitBytes, current.DurationSec)
 	if err != nil {
 		s.manager.addLog(identifier, "error", "Telegram 视频切分失败: "+err.Error())
 		return
@@ -104,22 +110,41 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 			}
 			s.setUploadStage(identifier, chatID, chatIndex+1, len(settings.ChatIDs), start+1, end, len(parts))
 			progress := func(delta int64) { s.recordUploadProgress(identifier, delta) }
+			var sent []telegramMessage
 			var uploadErr error
 			if telegramMediaGroupNeedsStaging(groupBytes) {
-				s.manager.addLog(identifier, "info", fmt.Sprintf("相册文件段 %d-%d 总计 %s，改用 file_id 暂存以避开 Bot API 4000 MB 请求上限", start+1, end, telegramFormatBytes(groupBytes)))
-				uploadErr = s.sendMediaGroupUsingFileIDs(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress)
+				s.manager.addLog(identifier, "info", fmt.Sprintf("相册文件段 %d-%d 总计 %s，将逐段传入本地 Bot API 并等待 Telegram 确认，再使用 file_id 组成相册", start+1, end, telegramFormatBytes(groupBytes)))
+				status := func(part int, confirmed bool) {
+					if confirmed {
+						s.manager.addLog(identifier, "info", fmt.Sprintf("Telegram 已确认文件段 %d/%d", part, len(parts)))
+						return
+					}
+					s.manager.addLog(identifier, "info", fmt.Sprintf("文件段 %d/%d 已传入本地 Bot API，正在等待 Telegram 确认", part, len(parts)))
+				}
+				sent, uploadErr = s.sendMediaGroupUsingFileIDs(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress, status)
 			} else {
-				uploadErr = s.sendMediaGroup(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress)
+				sent, uploadErr = s.sendMediaGroup(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress)
 			}
 			if uploadErr != nil {
 				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 视频相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, uploadErr))
 				return
+			}
+			if err := s.saveSentTelegramAlbum(chatID, identifier, current.OutputName, sent); err != nil {
+				s.manager.addLog(identifier, "warning", fmt.Sprintf("Telegram 相册已发送，但无法登记后续图片编辑信息（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
 			}
 			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 视频相册文件段 %d-%d/%d 到 Chat %d", start+1, end, len(parts), chatID))
 			start = end
 		}
 	}
 	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
+}
+
+func telegramEffectiveSplitBytes(configuredMB int) int64 {
+	configuredBytes := int64(configuredMB) * 1_000_000
+	if configuredBytes > telegramStableSegmentLimitBytes {
+		return telegramStableSegmentLimitBytes
+	}
+	return configuredBytes
 }
 
 func telegramMediaGroupNeedsStaging(totalBytes int64) bool {
@@ -182,7 +207,7 @@ func (s *telegramService) recordUploadProgress(identifier string, delta int64) {
 			for progress.NextLogAt <= percent {
 				progress.NextLogAt += telegramUploadLogStepPercent
 			}
-			message = "Telegram 上传进度：" + telegramUploadProgressText(progress)
+			message = "传入本地 Bot API 进度：" + telegramUploadProgressText(progress)
 		}
 	}
 	s.mu.Unlock()

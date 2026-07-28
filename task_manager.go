@@ -36,6 +36,7 @@ func newTaskManager(outputDir string) *taskManager {
 }
 
 func newTaskManagerWithStore(defaults appSettings, storage *store) *taskManager {
+	setConfiguredFFmpegPath(defaults.FFmpegPath)
 	return &taskManager{
 		tasks:      make(map[string]*task),
 		cancels:    make(map[string]context.CancelFunc),
@@ -68,6 +69,11 @@ func (m *taskManager) updateSettings(next appSettings) error {
 	if err := validateCacheRetentionHours(next.CacheRetentionHours); err != nil {
 		return err
 	}
+	ffmpegPath, err := normalizeFFmpegPath(next.FFmpegPath)
+	if err != nil {
+		return err
+	}
+	next.FFmpegPath = ffmpegPath
 	next.OutputDir, next.CacheDir = outputDir, cacheDir
 	if err := os.MkdirAll(next.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("创建默认保存目录失败: %w", err)
@@ -83,6 +89,7 @@ func (m *taskManager) updateSettings(next appSettings) error {
 	m.mu.Lock()
 	m.defaults, m.outputDir = next, next.OutputDir
 	m.mu.Unlock()
+	setConfiguredFFmpegPath(next.FFmpegPath)
 	m.cleanupExpiredCaches(time.Now())
 	return nil
 }

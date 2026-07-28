@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ const databaseFileName = "m3u8-downloader.db"
 type appSettings struct {
 	OutputDir           string `json:"outputDirectory"`
 	CacheDir            string `json:"cacheDirectory"`
+	FFmpegPath          string `json:"ffmpegPath"`
 	DeleteCache         bool   `json:"deleteCache"`
 	WorkerCount         int    `json:"workerCount"`
 	CacheRetentionHours int    `json:"cacheRetentionHours"`
@@ -104,11 +106,132 @@ CREATE TABLE IF NOT EXISTS task_logs (
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS task_logs_task_sequence ON task_logs(task_id, sequence);
+CREATE TABLE IF NOT EXISTS telegram_albums (
+  chat_id INTEGER NOT NULL,
+  media_group_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  output_name TEXT NOT NULL,
+  caption TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, media_group_id)
+);
+CREATE TABLE IF NOT EXISTS telegram_album_items (
+  chat_id INTEGER NOT NULL,
+  media_group_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  media_type TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  PRIMARY KEY (chat_id, media_group_id, position)
+);
+CREATE INDEX IF NOT EXISTS telegram_album_items_message ON telegram_album_items(chat_id, message_id);
 `)
 	if err != nil {
 		return fmt.Errorf("初始化 SQLite 数据表失败: %w", err)
 	}
+	added, err := s.ensureTelegramAlbumCaptionColumn()
+	if err != nil {
+		return fmt.Errorf("迁移 Telegram 相册说明字段失败: %w", err)
+	}
+	if added {
+		if _, err := s.db.Exec(`UPDATE telegram_albums SET caption = output_name`); err != nil {
+			return fmt.Errorf("迁移 Telegram 相册说明数据失败: %w", err)
+		}
+	}
 	return nil
+}
+
+func (s *store) ensureTelegramAlbumCaptionColumn() (bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(telegram_albums)`)
+	if err != nil {
+		return false, err
+	}
+	hasCaption := false
+	for rows.Next() {
+		var columnID, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&columnID, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		if name == "caption" {
+			hasCaption = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, err
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	if hasCaption {
+		return false, nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE telegram_albums ADD COLUMN caption TEXT NOT NULL DEFAULT ''`); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *store) saveTelegramAlbum(album telegramAlbum) error {
+	transaction, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.Exec(`INSERT INTO telegram_albums(chat_id, media_group_id, task_id, output_name, caption, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, media_group_id) DO UPDATE SET task_id=excluded.task_id, output_name=excluded.output_name, caption=excluded.caption, created_at=excluded.created_at`, album.ChatID, album.MediaGroupID, album.TaskID, album.OutputName, album.Caption, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`DELETE FROM telegram_album_items WHERE chat_id = ? AND media_group_id = ?`, album.ChatID, album.MediaGroupID); err != nil {
+		return err
+	}
+	for position, item := range album.Items {
+		if _, err := transaction.Exec(`INSERT INTO telegram_album_items(chat_id, media_group_id, position, message_id, media_type, file_id) VALUES(?, ?, ?, ?, ?, ?)`, album.ChatID, album.MediaGroupID, position, item.MessageID, item.Type, item.FileID); err != nil {
+			return err
+		}
+	}
+	return transaction.Commit()
+}
+
+func (s *store) loadTelegramAlbum(chatID int64, mediaGroupID string) (*telegramAlbum, error) {
+	var album telegramAlbum
+	err := s.db.QueryRow(`SELECT chat_id, media_group_id, task_id, output_name, caption FROM telegram_albums WHERE chat_id = ? AND media_group_id = ?`, chatID, mediaGroupID).Scan(&album.ChatID, &album.MediaGroupID, &album.TaskID, &album.OutputName, &album.Caption)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT message_id, media_type, file_id FROM telegram_album_items WHERE chat_id = ? AND media_group_id = ? ORDER BY position`, chatID, mediaGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item telegramAlbumItem
+		if err := rows.Scan(&item.MessageID, &item.Type, &item.FileID); err != nil {
+			return nil, err
+		}
+		album.Items = append(album.Items, item)
+	}
+	return &album, rows.Err()
+}
+
+func (s *store) deleteTelegramAlbum(chatID int64, mediaGroupID string) error {
+	transaction, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.Exec(`DELETE FROM telegram_album_items WHERE chat_id = ? AND media_group_id = ?`, chatID, mediaGroupID); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`DELETE FROM telegram_albums WHERE chat_id = ? AND media_group_id = ?`, chatID, mediaGroupID); err != nil {
+		return err
+	}
+	return transaction.Commit()
 }
 
 func defaultSettings() (appSettings, error) {
@@ -120,13 +243,18 @@ func defaultSettings() (appSettings, error) {
 	if err != nil {
 		return appSettings{}, err
 	}
-	return appSettings{OutputDir: outputDir, CacheDir: cacheDir, DeleteCache: true, WorkerCount: 8, CacheRetentionHours: 168}, nil
+	ffmpegPath := configuredFFmpegPath()
+	if ffmpegPath == "" {
+		ffmpegPath = strings.TrimSpace(os.Getenv("FFMPEG_PATH"))
+	}
+	return appSettings{OutputDir: outputDir, CacheDir: cacheDir, FFmpegPath: ffmpegPath, DeleteCache: true, WorkerCount: 8, CacheRetentionHours: 168}, nil
 }
 
 func (s *store) loadSettings(fallback appSettings) (appSettings, error) {
 	defaults := map[string]string{
 		"output_directory":      fallback.OutputDir,
 		"cache_directory":       fallback.CacheDir,
+		"ffmpeg_path":           fallback.FFmpegPath,
 		"delete_cache":          strconv.FormatBool(fallback.DeleteCache),
 		"worker_count":          strconv.Itoa(fallback.WorkerCount),
 		"cache_retention_hours": strconv.Itoa(fallback.CacheRetentionHours),
@@ -164,13 +292,14 @@ func (s *store) loadSettings(fallback appSettings) (appSettings, error) {
 	if err != nil || validateCacheRetentionHours(cacheRetentionHours) != nil {
 		return appSettings{}, errors.New("缓存保留时长设置无效")
 	}
-	return appSettings{OutputDir: values["output_directory"], CacheDir: values["cache_directory"], DeleteCache: deleteCache, WorkerCount: workerCount, CacheRetentionHours: cacheRetentionHours}, nil
+	return appSettings{OutputDir: values["output_directory"], CacheDir: values["cache_directory"], FFmpegPath: values["ffmpeg_path"], DeleteCache: deleteCache, WorkerCount: workerCount, CacheRetentionHours: cacheRetentionHours}, nil
 }
 
 func (s *store) saveSettings(settings appSettings) error {
 	values := map[string]string{
 		"output_directory":      settings.OutputDir,
 		"cache_directory":       settings.CacheDir,
+		"ffmpeg_path":           settings.FFmpegPath,
 		"delete_cache":          strconv.FormatBool(settings.DeleteCache),
 		"worker_count":          strconv.Itoa(settings.WorkerCount),
 		"cache_retention_hours": strconv.Itoa(settings.CacheRetentionHours),

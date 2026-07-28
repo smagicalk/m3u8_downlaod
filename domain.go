@@ -78,3 +78,7 @@ type directorySelectionRequest struct {
 type directorySelectionResponse struct {
 	Path string `json:"path"`
 }
+
+type fileSelectionRequest struct {
+	InitialPath string `json:"initialPath"`
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 const telegramTaskRefreshInterval = 3 * time.Second
 const telegramTaskListPageSize = 8
+const telegramCallbackAnswerTimeout = 5 * time.Second
 
 const (
 	telegramSubmissionSource  = "source"
@@ -50,9 +52,25 @@ type telegramUpdate struct {
 }
 
 type telegramMessage struct {
-	MessageID int          `json:"message_id"`
-	Chat      telegramChat `json:"chat"`
-	Text      string       `json:"text"`
+	MessageID      int                 `json:"message_id"`
+	MediaGroupID   string              `json:"media_group_id"`
+	Chat           telegramChat        `json:"chat"`
+	Text           string              `json:"text"`
+	Caption        string              `json:"caption"`
+	Photo          []telegramPhotoSize `json:"photo"`
+	Video          *telegramVideo      `json:"video"`
+	ReplyToMessage *telegramMessage    `json:"reply_to_message"`
+}
+
+type telegramPhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size"`
+}
+
+type telegramVideo struct {
+	FileID string `json:"file_id"`
 }
 
 type telegramChat struct {
@@ -83,6 +101,15 @@ func (s *telegramService) handleUpdate(ctx context.Context, settings telegramSet
 		if !telegramChatAllowed(settings, message.Chat.ID) {
 			return
 		}
+		if s.handleAlbumImportMessage(ctx, settings, message) {
+			return
+		}
+		if s.handleAlbumEditMessage(ctx, settings, message) {
+			return
+		}
+		if s.handleAlbumPhotoMessage(ctx, settings, message) {
+			return
+		}
 		text := strings.TrimSpace(message.Text)
 		if s.handleSubmissionMessage(ctx, settings, message.Chat.ID, text) {
 			return
@@ -106,11 +133,22 @@ func (s *telegramService) handleUpdate(ctx context.Context, settings telegramSet
 	if !telegramChatAllowed(settings, chatID) {
 		return
 	}
-	_ = s.call(ctx, settings, "answerCallbackQuery", map[string]any{"callback_query_id": update.CallbackQuery.ID}, nil)
+	go s.answerCallbackQuery(settings, update.CallbackQuery.ID)
 	s.handleCallback(ctx, settings, chatID, update.CallbackQuery.Message.MessageID, update.CallbackQuery.Data)
 }
 
+func (s *telegramService) answerCallbackQuery(settings telegramSettings, callbackQueryID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), telegramCallbackAnswerTimeout)
+	defer cancel()
+	if err := s.call(ctx, settings, "answerCallbackQuery", map[string]any{"callback_query_id": callbackQueryID}, nil); err != nil {
+		log.Printf("Telegram 按钮应答失败（Callback %s）: %v", callbackQueryID, err)
+	}
+}
+
 func (s *telegramService) handleCallback(ctx context.Context, settings telegramSettings, chatID int64, messageID int, data string) {
+	if s.handleAlbumCallback(ctx, settings, chatID, messageID, data) {
+		return
+	}
 	if data == "tasks" || data == "completed" {
 		s.stopTaskView(chatID, messageID)
 		s.editTaskList(ctx, settings, chatID, messageID, data == "completed", 0)
@@ -123,6 +161,10 @@ func (s *telegramService) handleCallback(ctx context.Context, settings telegramS
 	}
 	if data == "submit" {
 		s.beginSubmission(ctx, settings, chatID)
+		return
+	}
+	if data == "album-import" {
+		s.beginAlbumImportMode(ctx, settings, chatID)
 		return
 	}
 	if data == "submit-cancel" {
@@ -198,7 +240,7 @@ func (s *telegramService) taskListPage(completedOnly bool, page int) (string, te
 	page = min(max(page, 0), pageCount-1)
 	start := page * telegramTaskListPageSize
 	end := min(start+telegramTaskListPageSize, len(filtered))
-	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "提交下载", CallbackData: "submit"}}}}
+	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "提交下载", CallbackData: "submit"}, {Text: "导入相册", CallbackData: "album-import"}}}}
 	for _, current := range filtered[start:end] {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: fmt.Sprintf("%s · %s", current.OutputName, telegramStatusLabel(current.Status)), CallbackData: "task:" + current.ID}})
 	}
@@ -265,7 +307,7 @@ func (s *telegramService) taskDetails(current *task) (string, telegramInlineKeyb
 	text := fmt.Sprintf("%s\n状态：%s\n%s", current.OutputName, telegramStatusLabel(current.Status), telegramTaskProgress(current))
 	progress := s.uploadProgressSnapshot(current.ID)
 	if progress != nil {
-		text += "\nTelegram 上传：" + telegramUploadProgressText(progress)
+		text += "\n传入本地 Bot API：" + telegramUploadProgressText(progress)
 	}
 	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "刷新", CallbackData: "refresh:" + current.ID}, {Text: "任务列表", CallbackData: "tasks"}}}}
 	if current.Status == statusRunning {
