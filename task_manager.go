@@ -87,20 +87,37 @@ func (m *taskManager) updateSettings(next appSettings) error {
 	return nil
 }
 
-func (m *taskManager) restore(items []*task) {
+func (m *taskManager) restore(items []*task) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	toResume := make([]string, 0, len(items))
 	for _, current := range items {
-		if current.Status == statusQueued || current.Status == statusRunning || current.Status == statusPaused {
-			current.Status = statusFailed
-			current.Error = "服务重启，任务已中断"
-			finished := time.Now()
-			current.FinishedAt = &finished
-			appendTaskLog(current, "warning", current.Error)
+		if taskNeedsRecovery(current) {
+			if current.Status != statusPaused {
+				current.Status = statusQueued
+			}
+			current.Error = ""
+			current.FinishedAt = nil
+			appendTaskLog(current, "warning", "服务重启，已从本地缓存恢复任务")
 			m.persistTaskLocked(current)
 			m.persistLogLocked(current)
+			toResume = append(toResume, current.ID)
 		}
 		m.tasks[current.ID] = current
+	}
+	return toResume
+}
+
+func taskNeedsRecovery(current *task) bool {
+	if current.Status == statusQueued || current.Status == statusRunning || current.Status == statusPaused {
+		return true
+	}
+	return current.Status == statusFailed && current.Error == "服务重启，任务已中断"
+}
+
+func (m *taskManager) resumeRecovered(identifiers []string) {
+	for _, identifier := range identifiers {
+		go m.run(identifier)
 	}
 }
 
@@ -270,6 +287,10 @@ func (m *taskManager) run(identifier string) {
 	resumeKey := current.CacheKey
 	workerCount := current.WorkerCount
 	m.mu.RUnlock()
+	if err := m.waitForResume(ctx, identifier); err != nil {
+		m.finish(identifier, statusFailed, "任务已取消")
+		return
+	}
 	m.setPhase(identifier, "downloading")
 	m.addLog(identifier, "info", fmt.Sprintf("开始使用 Go 下载器，分片并发数为 %d", workerCount))
 	onProgress := func(completedSegments, totalSegments int, downloadedBytes int64, completedSeconds, totalSeconds float64) {

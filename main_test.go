@@ -231,6 +231,27 @@ func TestGoDownloadTaskCanPauseAndResumeWithoutFFmpegProcess(t *testing.T) {
 	}
 }
 
+func TestRestoreQueuesInterruptedTasksAndKeepsPausedTasksPaused(t *testing.T) {
+	manager := newTaskManager(t.TempDir())
+	interrupted := &task{ID: "interrupted", Status: statusRunning, Phase: "downloading"}
+	legacyInterrupted := &task{ID: "legacy", Status: statusFailed, Error: "服务重启，任务已中断"}
+	paused := &task{ID: "paused", Status: statusPaused, Phase: "downloading"}
+
+	toResume := manager.restore([]*task{interrupted, legacyInterrupted, paused})
+	if got := manager.snapshot("interrupted"); got.Status != statusQueued || got.Error != "" || got.FinishedAt != nil {
+		t.Fatalf("interrupted task after restore = %#v", got)
+	}
+	if got := manager.snapshot("legacy"); got.Status != statusQueued || got.Error != "" || got.FinishedAt != nil {
+		t.Fatalf("legacy interrupted task after restore = %#v", got)
+	}
+	if got := manager.snapshot("paused"); got.Status != statusPaused {
+		t.Fatalf("paused task after restore = %#v", got)
+	}
+	if len(toResume) != 3 || toResume[0] != "interrupted" || toResume[1] != "legacy" || toResume[2] != "paused" {
+		t.Fatalf("recovery queue = %v", toResume)
+	}
+}
+
 func TestExpiredStoppedTaskCacheIsRemoved(t *testing.T) {
 	cacheDirectory := t.TempDir()
 	cachePath := filepath.Join(cacheDirectory, "hls-cache-key")
