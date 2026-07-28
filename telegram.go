@@ -21,6 +21,7 @@ import (
 
 const telegramPollTimeout = 25 * time.Second
 const telegramTaskRefreshInterval = 3 * time.Second
+const telegramMediaGroupMaxItems = 10
 
 const (
 	telegramSubmissionSource  = "source"
@@ -247,22 +248,33 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 	s.manager.addLog(identifier, "info", fmt.Sprintf("开始上传到 Telegram，共 %d 个文件段", len(parts)))
 	context := context.Background()
 	for _, chatID := range settings.ChatIDs {
-		for index, part := range parts {
-			caption := current.OutputName
-			method := "sendVideo"
-			field := "video"
-			if len(parts) > 1 {
-				caption = fmt.Sprintf("%s (%d/%d)", current.OutputName, index+1, len(parts))
-				method, field = "sendDocument", "document"
-			}
-			if err := s.sendFile(context, settings, method, chatID, field, part, caption); err != nil {
-				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 上传失败（Chat %d，第 %d 段）: %v", chatID, index+1, err))
+		if len(parts) == 1 {
+			if err := s.sendFile(context, settings, "sendVideo", chatID, "video", parts[0], current.OutputName); err != nil {
+				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 上传失败（Chat %d）: %v", chatID, err))
 				return
 			}
-			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 文件段 %d/%d 到 Chat %d", index+1, len(parts), chatID))
+			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 视频到 Chat %d", chatID))
+			continue
+		}
+		for start := 0; start < len(parts); {
+			end := telegramMediaGroupEnd(start, len(parts))
+			if err := s.sendMediaGroup(context, settings, chatID, parts[start:end], current.OutputName, start+1, len(parts)); err != nil {
+				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
+				return
+			}
+			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 相册文件段 %d-%d/%d 到 Chat %d", start+1, end, len(parts), chatID))
+			start = end
 		}
 	}
 	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
+}
+
+func telegramMediaGroupEnd(start, total int) int {
+	end := min(start+telegramMediaGroupMaxItems, total)
+	if total-end == 1 {
+		end--
+	}
+	return end
 }
 
 func (s *telegramService) poll(ctx context.Context, settings telegramSettings) {
@@ -684,6 +696,30 @@ func (s *telegramService) sendFile(ctx context.Context, settings telegramSetting
 	return s.sendTelegramRequest(request, nil)
 }
 
+func (s *telegramService) sendMediaGroup(ctx context.Context, settings telegramSettings, chatID int64, paths []string, outputName string, startIndex, totalParts int) error {
+	if len(paths) < 2 || len(paths) > telegramMediaGroupMaxItems {
+		return errors.New("Telegram 相册文件段数量必须为 2 至 10")
+	}
+	reader, writer := io.Pipe()
+	form := multipart.NewWriter(writer)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(settings.APIBaseURL, "/")+"/bot"+settings.BotToken+"/sendMediaGroup", reader)
+	if err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return err
+	}
+	request.Header.Set("Content-Type", form.FormDataContentType())
+	go func() {
+		if err := writeTelegramMediaGroupForm(form, chatID, paths, outputName, startIndex, totalParts); err != nil {
+			_ = writer.CloseWithError(err)
+			return
+		}
+		_ = writer.Close()
+	}()
+	defer reader.Close()
+	return s.sendTelegramRequest(request, nil)
+}
+
 func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, caption string, source io.Reader) error {
 	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
@@ -697,6 +733,50 @@ func writeTelegramFileForm(form *multipart.Writer, chatID int64, field, path, ca
 	}
 	if _, err := io.Copy(part, source); err != nil {
 		return err
+	}
+	return form.Close()
+}
+
+func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []string, outputName string, startIndex, totalParts int) error {
+	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return err
+	}
+	type inputMediaDocument struct {
+		Type    string `json:"type"`
+		Media   string `json:"media"`
+		Caption string `json:"caption,omitempty"`
+	}
+	media := make([]inputMediaDocument, 0, len(paths))
+	for index := range paths {
+		item := inputMediaDocument{Type: "document", Media: fmt.Sprintf("attach://file%d", index)}
+		if index == 0 {
+			item.Caption = fmt.Sprintf("%s (%d/%d)", outputName, startIndex, totalParts)
+		}
+		media = append(media, item)
+	}
+	encodedMedia, err := json.Marshal(media)
+	if err != nil {
+		return err
+	}
+	if err := form.WriteField("media", string(encodedMedia)); err != nil {
+		return err
+	}
+	for index, path := range paths {
+		source, err := os.Open(path)
+		if err != nil {
+			return errors.New("读取待上传文件失败")
+		}
+		part, createErr := form.CreateFormFile(fmt.Sprintf("file%d", index), filepath.Base(path))
+		if createErr == nil {
+			_, createErr = io.Copy(part, source)
+		}
+		closeErr := source.Close()
+		if createErr != nil {
+			return createErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
 	}
 	return form.Close()
 }

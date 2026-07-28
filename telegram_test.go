@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -113,6 +114,60 @@ func TestTelegramFileUploadStreamsMultipartContent(t *testing.T) {
 	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
 
 	if err := service.sendFile(context.Background(), settings, "sendDocument", 42, "document", path, "video.mp4 (1/3)"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTelegramMediaGroupStreamsDocumentAlbum(t *testing.T) {
+	directory := t.TempDir()
+	parts := []string{filepath.Join(directory, "video.part001"), filepath.Join(directory, "video.part002")}
+	for index, path := range parts {
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("video-content-%d", index+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/sendMediaGroup") {
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+		if err := request.ParseMultipartForm(1024 * 1024); err != nil {
+			t.Fatal(err)
+		}
+		if request.FormValue("chat_id") != "42" {
+			t.Fatalf("chat_id = %q", request.FormValue("chat_id"))
+		}
+		var media []struct {
+			Type    string `json:"type"`
+			Media   string `json:"media"`
+			Caption string `json:"caption"`
+		}
+		if err := json.Unmarshal([]byte(request.FormValue("media")), &media); err != nil {
+			t.Fatal(err)
+		}
+		if len(media) != 2 || media[0].Type != "document" || media[0].Media != "attach://file0" || media[1].Media != "attach://file1" || media[0].Caption != "video.mp4 (1/2)" || media[1].Caption != "" {
+			t.Fatalf("media = %#v", media)
+		}
+		for index, field := range []string{"file0", "file1"} {
+			file, _, err := request.FormFile(field)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, readErr := io.ReadAll(file)
+			_ = file.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(content) != fmt.Sprintf("video-content-%d", index+1) {
+				t.Fatalf("file %d content = %q", index+1, content)
+			}
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":[]}`))
+	}))
+	defer server.Close()
+	service := &telegramService{client: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+
+	if err := service.sendMediaGroup(context.Background(), settings, 42, parts, "video.mp4", 1, 2); err != nil {
 		t.Fatal(err)
 	}
 }
