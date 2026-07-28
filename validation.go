@@ -92,6 +92,13 @@ func normalizeWorkerCount(workerCount *int, legacyConcurrentDownloads *bool) (in
 	}
 }
 
+func validateCacheRetentionHours(hours int) error {
+	if hours < 0 || hours > 8760 {
+		return errors.New("缓存保留时长必须为 0 至 8760 小时")
+	}
+	return nil
+}
+
 func resolveDirectory(raw, fallback string) (string, error) {
 	directory := strings.TrimSpace(raw)
 	if directory == "" {

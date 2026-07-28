@@ -65,6 +65,9 @@ func (m *taskManager) updateSettings(next appSettings) error {
 	if err := validateWorkerCount(next.WorkerCount); err != nil {
 		return err
 	}
+	if err := validateCacheRetentionHours(next.CacheRetentionHours); err != nil {
+		return err
+	}
 	next.OutputDir, next.CacheDir = outputDir, cacheDir
 	if err := os.MkdirAll(next.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("创建默认保存目录失败: %w", err)
@@ -80,6 +83,7 @@ func (m *taskManager) updateSettings(next appSettings) error {
 	m.mu.Lock()
 	m.defaults, m.outputDir = next, next.OutputDir
 	m.mu.Unlock()
+	m.cleanupExpiredCaches(time.Now())
 	return nil
 }
 
@@ -97,6 +101,52 @@ func (m *taskManager) restore(items []*task) {
 			m.persistLogLocked(current)
 		}
 		m.tasks[current.ID] = current
+	}
+}
+
+func (m *taskManager) startCacheCleanup() {
+	m.cleanupExpiredCaches(time.Now())
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			m.cleanupExpiredCaches(now)
+		}
+	}()
+}
+
+func (m *taskManager) cleanupExpiredCaches(now time.Time) {
+	m.mu.RLock()
+	retentionHours := m.defaults.CacheRetentionHours
+	items := make([]*task, 0, len(m.tasks))
+	for _, current := range m.tasks {
+		if current.Status != statusCompleted && current.Status != statusFailed && current.Status != statusCancelled {
+			continue
+		}
+		copy := *current
+		items = append(items, &copy)
+	}
+	m.mu.RUnlock()
+	if retentionHours == 0 {
+		return
+	}
+	deadline := now.Add(-time.Duration(retentionHours) * time.Hour)
+	for _, current := range items {
+		if current.FinishedAt == nil || current.FinishedAt.After(deadline) || current.CacheKey == "" {
+			continue
+		}
+		cachePath := filepath.Join(current.CacheDir, "hls-"+current.CacheKey)
+		if _, err := os.Stat(cachePath); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			m.addLog(current.ID, "warning", "检查过期任务缓存失败")
+			continue
+		}
+		if err := os.RemoveAll(cachePath); err != nil {
+			m.addLog(current.ID, "warning", "删除过期任务缓存失败")
+			continue
+		}
+		m.addLog(current.ID, "info", "缓存保留期已结束，已删除任务缓存")
 	}
 }
 

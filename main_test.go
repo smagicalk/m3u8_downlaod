@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateSourceURL(t *testing.T) {
@@ -225,6 +228,25 @@ func TestGoDownloadTaskCanPauseAndResumeWithoutFFmpegProcess(t *testing.T) {
 	}
 	if status := manager.snapshot("test").Status; status != statusRunning {
 		t.Fatalf("resumed status = %q, want %q", status, statusRunning)
+	}
+}
+
+func TestExpiredStoppedTaskCacheIsRemoved(t *testing.T) {
+	cacheDirectory := t.TempDir()
+	cachePath := filepath.Join(cacheDirectory, "hls-cache-key")
+	if err := os.MkdirAll(cachePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "segment.ts"), []byte("cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finished := time.Now().Add(-2 * time.Hour)
+	manager := newTaskManagerWithStore(appSettings{OutputDir: t.TempDir(), CacheDir: cacheDirectory, DeleteCache: false, WorkerCount: 8, CacheRetentionHours: 1}, nil)
+	manager.tasks["task-1"] = &task{ID: "task-1", CacheDir: cacheDirectory, CacheKey: "cache-key", Status: statusCancelled, FinishedAt: &finished}
+
+	manager.cleanupExpiredCaches(time.Now())
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired stopped task cache still exists: %v", err)
 	}
 }
 

@@ -114,3 +114,57 @@ func TestTelegramAllowsOnlyBoundChatAndSendsInlineKeyboard(t *testing.T) {
 		t.Fatalf("channel post requests = %d, want 2", requests.Load())
 	}
 }
+
+func TestTelegramSubmissionPromptAndTaskControls(t *testing.T) {
+	var messages []struct {
+		Text        string                 `json:"text"`
+		ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/sendMessage") {
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+		var payload struct {
+			Text        string                 `json:"text"`
+			ReplyMarkup telegramInlineKeyboard `json:"reply_markup"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, payload)
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	manager := newTaskManager(t.TempDir())
+	manager.tasks["task-1"] = &task{ID: "task-1", OutputName: "video.mp4", Status: statusRunning, Phase: "downloading"}
+	service := &telegramService{manager: manager, client: server.Client(), uploading: make(map[string]struct{}), submissions: make(map[int64]struct{})}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret", ChatIDs: []int64{42}, SplitSizeMB: 1900}
+
+	service.handleUpdate(context.Background(), settings, telegramUpdate{Message: &telegramMessage{Chat: telegramChat{ID: 42}, Text: "/start"}})
+	if len(messages) != 1 || !telegramKeyboardHasCallback(messages[0].ReplyMarkup, "submit") {
+		t.Fatal("Telegram menu must include a submit button")
+	}
+	service.handleCallback(context.Background(), settings, 42, "submit")
+	if !service.awaitingSubmission(42) {
+		t.Fatal("submit button must put the chat into URL input mode")
+	}
+	service.handleCallback(context.Background(), settings, 42, "pause:task-1")
+	if status := manager.snapshot("task-1").Status; status != statusPaused {
+		t.Fatalf("paused task status = %q, want %q", status, statusPaused)
+	}
+	service.handleCallback(context.Background(), settings, 42, "stop:task-1")
+	if status := manager.snapshot("task-1").Status; status != statusCancelled {
+		t.Fatalf("stopped task status = %q, want %q", status, statusCancelled)
+	}
+}
+
+func telegramKeyboardHasCallback(keyboard telegramInlineKeyboard, callback string) bool {
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if button.CallbackData == callback {
+				return true
+			}
+		}
+	}
+	return false
+}

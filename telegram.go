@@ -41,10 +41,11 @@ type telegramService struct {
 	store   *store
 	client  *http.Client
 
-	mu        sync.RWMutex
-	settings  telegramSettings
-	cancel    context.CancelFunc
-	uploading map[string]struct{}
+	mu          sync.RWMutex
+	settings    telegramSettings
+	cancel      context.CancelFunc
+	uploading   map[string]struct{}
+	submissions map[int64]struct{}
 }
 
 func newTelegramService(storage *store, manager *taskManager) (*telegramService, error) {
@@ -52,7 +53,7 @@ func newTelegramService(storage *store, manager *taskManager) (*telegramService,
 	if err != nil {
 		return nil, err
 	}
-	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, settings: settings, uploading: make(map[string]struct{})}, nil
+	return &telegramService{manager: manager, store: storage, client: &http.Client{Timeout: telegramPollTimeout + 10*time.Second}, settings: settings, uploading: make(map[string]struct{}), submissions: make(map[int64]struct{})}, nil
 }
 
 func (s *telegramService) start() {
@@ -261,10 +262,19 @@ func (s *telegramService) handleUpdate(ctx context.Context, settings telegramSet
 		if !telegramChatAllowed(settings, message.Chat.ID) {
 			return
 		}
-		text := strings.TrimSpace(strings.Split(message.Text, "@")[0])
-		switch text {
+		text := strings.TrimSpace(message.Text)
+		if s.handleSubmissionMessage(ctx, settings, message.Chat.ID, text) {
+			return
+		}
+		command := ""
+		if fields := strings.Fields(text); len(fields) > 0 {
+			command = strings.TrimSpace(strings.Split(fields[0], "@")[0])
+		}
+		switch command {
 		case "/start", "/menu", "/tasks", "/completed":
-			s.sendTaskList(ctx, settings, message.Chat.ID, text == "/completed")
+			s.sendTaskList(ctx, settings, message.Chat.ID, command == "/completed")
+		case "/submit":
+			s.beginSubmission(ctx, settings, message.Chat.ID)
 		}
 		return
 	}
@@ -284,6 +294,15 @@ func (s *telegramService) handleCallback(ctx context.Context, settings telegramS
 		s.sendTaskList(ctx, settings, chatID, data == "completed")
 		return
 	}
+	if data == "submit" {
+		s.beginSubmission(ctx, settings, chatID)
+		return
+	}
+	if data == "submit-cancel" {
+		s.clearSubmission(chatID)
+		s.sendTaskList(ctx, settings, chatID, false)
+		return
+	}
 	parts := strings.SplitN(data, ":", 2)
 	if len(parts) != 2 {
 		return
@@ -298,7 +317,7 @@ func (s *telegramService) handleCallback(ctx context.Context, settings telegramS
 	case "resume":
 		s.manager.resume(identifier)
 		s.sendTaskDetails(ctx, settings, chatID, identifier)
-	case "cancel":
+	case "stop", "cancel":
 		s.manager.cancel(identifier)
 		s.sendTaskDetails(ctx, settings, chatID, identifier)
 	case "upload":
@@ -314,6 +333,7 @@ func (s *telegramService) sendTaskList(ctx context.Context, settings telegramSet
 	items := s.manager.all()
 	sort.Slice(items, func(left, right int) bool { return items[left].CreatedAt.After(items[right].CreatedAt) })
 	keyboard := telegramInlineKeyboard{}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "提交下载", CallbackData: "submit"}})
 	count := 0
 	for _, current := range items {
 		if completedOnly && current.Status != statusCompleted {
@@ -342,15 +362,67 @@ func (s *telegramService) sendTaskDetails(ctx context.Context, settings telegram
 	text := fmt.Sprintf("%s\n状态：%s\n%s", current.OutputName, telegramStatusLabel(current.Status), telegramTaskProgress(current))
 	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "刷新", CallbackData: "refresh:" + current.ID}, {Text: "任务列表", CallbackData: "tasks"}}}}
 	if current.Status == statusRunning {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "暂停", CallbackData: "pause:" + current.ID}, {Text: "取消", CallbackData: "cancel:" + current.ID}})
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "暂停", CallbackData: "pause:" + current.ID}, {Text: "停止", CallbackData: "stop:" + current.ID}})
 	}
 	if current.Status == statusPaused {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "继续", CallbackData: "resume:" + current.ID}, {Text: "取消", CallbackData: "cancel:" + current.ID}})
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "继续", CallbackData: "resume:" + current.ID}, {Text: "停止", CallbackData: "stop:" + current.ID}})
 	}
 	if current.Status == statusCompleted {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{Text: "上传视频", CallbackData: "upload:" + current.ID}})
 	}
 	_ = s.sendMessage(ctx, settings, chatID, text, keyboard)
+}
+
+func (s *telegramService) awaitingSubmission(chatID int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, waiting := s.submissions[chatID]
+	return waiting
+}
+
+func (s *telegramService) beginSubmission(ctx context.Context, settings telegramSettings, chatID int64) {
+	s.mu.Lock()
+	if s.submissions == nil {
+		s.submissions = make(map[int64]struct{})
+	}
+	s.submissions[chatID] = struct{}{}
+	s.mu.Unlock()
+	keyboard := telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{{Text: "取消提交", CallbackData: "submit-cancel"}}}}
+	_ = s.sendMessage(ctx, settings, chatID, "请发送 M3U8 地址。下载将使用网页已保存的默认目录、缓存策略和并发数。", keyboard)
+}
+
+func (s *telegramService) clearSubmission(chatID int64) {
+	s.mu.Lock()
+	delete(s.submissions, chatID)
+	s.mu.Unlock()
+}
+
+func (s *telegramService) handleSubmissionMessage(ctx context.Context, settings telegramSettings, chatID int64, text string) bool {
+	if !s.awaitingSubmission(chatID) {
+		return false
+	}
+	if text == "/cancel" || text == "/menu" || text == "/start" {
+		s.clearSubmission(chatID)
+		if text != "/cancel" {
+			s.sendTaskList(ctx, settings, chatID, false)
+		} else {
+			_ = s.sendMessage(ctx, settings, chatID, "已取消提交。", nil)
+		}
+		return true
+	}
+	if strings.HasPrefix(text, "/") {
+		return false
+	}
+	defaults := s.manager.settings()
+	created, err := s.manager.create(text, "", "", "", modeDownloadFirst, "", "", "", defaults.DeleteCache, defaults.WorkerCount)
+	if err != nil {
+		_ = s.sendMessage(ctx, settings, chatID, "提交失败："+err.Error()+"。请重新发送 M3U8 地址，或点击取消提交。", nil)
+		return true
+	}
+	s.clearSubmission(chatID)
+	_ = s.sendMessage(ctx, settings, chatID, "任务已提交："+created.OutputName, nil)
+	s.sendTaskDetails(ctx, settings, chatID, created.ID)
+	return true
 }
 
 func (s *telegramService) sendMessage(ctx context.Context, settings telegramSettings, chatID int64, text string, keyboard any) error {

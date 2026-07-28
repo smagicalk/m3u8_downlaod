@@ -54,6 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 	manager.restore(items)
+	manager.startCacheCleanup()
 	telegram, err := newTelegramService(storage, manager)
 	if err != nil {
 		log.Fatal(err)

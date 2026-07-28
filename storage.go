@@ -15,10 +15,11 @@ import (
 const databaseFileName = "m3u8-downloader.db"
 
 type appSettings struct {
-	OutputDir   string `json:"outputDirectory"`
-	CacheDir    string `json:"cacheDirectory"`
-	DeleteCache bool   `json:"deleteCache"`
-	WorkerCount int    `json:"workerCount"`
+	OutputDir           string `json:"outputDirectory"`
+	CacheDir            string `json:"cacheDirectory"`
+	DeleteCache         bool   `json:"deleteCache"`
+	WorkerCount         int    `json:"workerCount"`
+	CacheRetentionHours int    `json:"cacheRetentionHours"`
 }
 
 type telegramSettings struct {
@@ -119,15 +120,16 @@ func defaultSettings() (appSettings, error) {
 	if err != nil {
 		return appSettings{}, err
 	}
-	return appSettings{OutputDir: outputDir, CacheDir: cacheDir, DeleteCache: true, WorkerCount: 8}, nil
+	return appSettings{OutputDir: outputDir, CacheDir: cacheDir, DeleteCache: true, WorkerCount: 8, CacheRetentionHours: 168}, nil
 }
 
 func (s *store) loadSettings(fallback appSettings) (appSettings, error) {
 	defaults := map[string]string{
-		"output_directory": fallback.OutputDir,
-		"cache_directory":  fallback.CacheDir,
-		"delete_cache":     strconv.FormatBool(fallback.DeleteCache),
-		"worker_count":     strconv.Itoa(fallback.WorkerCount),
+		"output_directory":      fallback.OutputDir,
+		"cache_directory":       fallback.CacheDir,
+		"delete_cache":          strconv.FormatBool(fallback.DeleteCache),
+		"worker_count":          strconv.Itoa(fallback.WorkerCount),
+		"cache_retention_hours": strconv.Itoa(fallback.CacheRetentionHours),
 	}
 	for key, value := range defaults {
 		if _, err := s.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {
@@ -158,15 +160,20 @@ func (s *store) loadSettings(fallback appSettings) (appSettings, error) {
 	if err != nil || validateWorkerCount(workerCount) != nil {
 		return appSettings{}, errors.New("默认并发数设置无效")
 	}
-	return appSettings{OutputDir: values["output_directory"], CacheDir: values["cache_directory"], DeleteCache: deleteCache, WorkerCount: workerCount}, nil
+	cacheRetentionHours, err := strconv.Atoi(values["cache_retention_hours"])
+	if err != nil || validateCacheRetentionHours(cacheRetentionHours) != nil {
+		return appSettings{}, errors.New("缓存保留时长设置无效")
+	}
+	return appSettings{OutputDir: values["output_directory"], CacheDir: values["cache_directory"], DeleteCache: deleteCache, WorkerCount: workerCount, CacheRetentionHours: cacheRetentionHours}, nil
 }
 
 func (s *store) saveSettings(settings appSettings) error {
 	values := map[string]string{
-		"output_directory": settings.OutputDir,
-		"cache_directory":  settings.CacheDir,
-		"delete_cache":     strconv.FormatBool(settings.DeleteCache),
-		"worker_count":     strconv.Itoa(settings.WorkerCount),
+		"output_directory":      settings.OutputDir,
+		"cache_directory":       settings.CacheDir,
+		"delete_cache":          strconv.FormatBool(settings.DeleteCache),
+		"worker_count":          strconv.Itoa(settings.WorkerCount),
+		"cache_retention_hours": strconv.Itoa(settings.CacheRetentionHours),
 	}
 	transaction, err := s.db.Begin()
 	if err != nil {
