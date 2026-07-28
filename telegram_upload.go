@@ -8,6 +8,7 @@ import (
 )
 
 const telegramUploadLogStepPercent = 5
+const telegramMultipartSafeLimitBytes int64 = 3_900_000_000
 
 type telegramUploadProgress struct {
 	TotalBytes    int64
@@ -95,9 +96,23 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		}
 		for start := 0; start < len(parts); {
 			end := telegramMediaGroupEnd(start, len(parts))
+			group := parts[start:end]
+			groupBytes, err := telegramMediaBytes(group)
+			if err != nil {
+				s.manager.addLog(identifier, "error", "读取 Telegram 相册文件段失败: "+err.Error())
+				return
+			}
 			s.setUploadStage(identifier, chatID, chatIndex+1, len(settings.ChatIDs), start+1, end, len(parts))
-			if err := s.sendMediaGroup(ctx, settings, chatID, parts[start:end], current.OutputName, start+1, len(parts), func(delta int64) { s.recordUploadProgress(identifier, delta) }); err != nil {
-				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 视频相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
+			progress := func(delta int64) { s.recordUploadProgress(identifier, delta) }
+			var uploadErr error
+			if telegramMediaGroupNeedsStaging(groupBytes) {
+				s.manager.addLog(identifier, "info", fmt.Sprintf("相册文件段 %d-%d 总计 %s，改用 file_id 暂存以避开 Bot API 4000 MB 请求上限", start+1, end, telegramFormatBytes(groupBytes)))
+				uploadErr = s.sendMediaGroupUsingFileIDs(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress)
+			} else {
+				uploadErr = s.sendMediaGroup(ctx, settings, chatID, group, current.OutputName, start+1, len(parts), progress)
+			}
+			if uploadErr != nil {
+				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 视频相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, uploadErr))
 				return
 			}
 			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 视频相册文件段 %d-%d/%d 到 Chat %d", start+1, end, len(parts), chatID))
@@ -105,6 +120,10 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		}
 	}
 	s.manager.addLog(identifier, "info", "Telegram 视频上传完成")
+}
+
+func telegramMediaGroupNeedsStaging(totalBytes int64) bool {
+	return totalBytes > telegramMultipartSafeLimitBytes
 }
 
 func telegramMediaBytes(paths []string) (int64, error) {

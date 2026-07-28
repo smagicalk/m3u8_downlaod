@@ -233,6 +233,69 @@ func TestTelegramMediaGroupReportsUploadedMediaBytes(t *testing.T) {
 	}
 }
 
+func TestTelegramLargeMediaGroupUsesFileIDsAndDeletesStagingMessages(t *testing.T) {
+	directory := t.TempDir()
+	parts := []string{filepath.Join(directory, "video.part001.mp4"), filepath.Join(directory, "video.part002.mp4")}
+	for index, path := range parts {
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("video-content-%d", index+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var videoUploads, albums, deletes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/sendVideo"):
+			if err := request.ParseMultipartForm(1024 * 1024); err != nil {
+				t.Fatal(err)
+			}
+			index := videoUploads.Add(1)
+			_, _ = writer.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"video":{"file_id":"file-id-%d"}}}`, 100+index, index)))
+		case strings.HasSuffix(request.URL.Path, "/sendMediaGroup"):
+			var payload struct {
+				Media []struct {
+					Media string `json:"media"`
+				} `json:"media"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload.Media) != 2 || payload.Media[0].Media != "file-id-1" || payload.Media[1].Media != "file-id-2" {
+				t.Fatalf("album media = %#v", payload.Media)
+			}
+			albums.Add(1)
+			_, _ = writer.Write([]byte(`{"ok":true,"result":[]}`))
+		case strings.HasSuffix(request.URL.Path, "/deleteMessage"):
+			deletes.Add(1)
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Fatalf("unexpected method path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	service := &telegramService{client: server.Client(), uploadClient: server.Client()}
+	settings := telegramSettings{APIBaseURL: server.URL, BotToken: "123:secret"}
+	var uploaded atomic.Int64
+
+	if err := service.sendMediaGroupUsingFileIDs(context.Background(), settings, 42, parts, "video.mp4", 1, 2, func(delta int64) { uploaded.Add(delta) }); err != nil {
+		t.Fatal(err)
+	}
+	if videoUploads.Load() != 2 || albums.Load() != 1 || deletes.Load() != 2 {
+		t.Fatalf("requests: videos=%d albums=%d deletes=%d", videoUploads.Load(), albums.Load(), deletes.Load())
+	}
+	if want := int64(len("video-content-1") + len("video-content-2")); uploaded.Load() != want {
+		t.Fatalf("uploaded bytes = %d, want %d", uploaded.Load(), want)
+	}
+}
+
+func TestTelegramLargeMultipartAlbumRequiresFileIDStaging(t *testing.T) {
+	if telegramMediaGroupNeedsStaging(telegramMultipartSafeLimitBytes) {
+		t.Fatal("safe payload limit must still use direct multipart upload")
+	}
+	if !telegramMediaGroupNeedsStaging(telegramMultipartSafeLimitBytes + 1) {
+		t.Fatal("payload above safe limit must use file_id staging")
+	}
+}
+
 func TestTelegramTaskListPaginatesEightTasksPerPage(t *testing.T) {
 	manager := newTaskManager(t.TempDir())
 	for index := 0; index < 17; index++ {
