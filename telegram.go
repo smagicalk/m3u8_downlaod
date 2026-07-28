@@ -240,7 +240,7 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		return
 	}
 	limitBytes := int64(settings.SplitSizeMB) * 1_000_000
-	parts, cleanup, err := splitTelegramFile(current.OutputPath, limitBytes)
+	parts, cleanup, err := splitTelegramVideo(current.OutputPath, limitBytes, current.DurationSec)
 	if err != nil {
 		s.manager.addLog(identifier, "error", "Telegram 视频切分失败: "+err.Error())
 		return
@@ -854,52 +854,6 @@ func telegramTaskProgress(current *task) string {
 		return "正在合并 MP4"
 	}
 	return "等待处理"
-}
-
-func splitTelegramFile(path string, maxBytes int64) ([]string, func(), error) {
-	if maxBytes <= 0 {
-		return nil, nil, errors.New("切分大小无效")
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if info.Size() <= maxBytes {
-		return []string{path}, func() {}, nil
-	}
-	directory, err := os.MkdirTemp("", "m3u8-telegram-")
-	if err != nil {
-		return nil, nil, err
-	}
-	cleanup := func() { _ = os.RemoveAll(directory) }
-	input, err := os.Open(path)
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	defer input.Close()
-	parts := make([]string, 0, (info.Size()+maxBytes-1)/maxBytes)
-	buffer := make([]byte, 1024*1024)
-	for index, remaining := 1, info.Size(); remaining > 0; index++ {
-		partPath := filepath.Join(directory, fmt.Sprintf("%s.part%03d", filepath.Base(path), index))
-		output, err := os.Create(partPath)
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		copied, copyErr := io.CopyBuffer(output, io.LimitReader(input, maxBytes), buffer)
-		closeErr := output.Close()
-		if copyErr != nil || closeErr != nil || copied == 0 {
-			cleanup()
-			if copyErr != nil {
-				return nil, nil, copyErr
-			}
-			return nil, nil, closeErr
-		}
-		parts = append(parts, partPath)
-		remaining -= copied
-	}
-	return parts, cleanup, nil
 }
 
 type telegramResponse struct {

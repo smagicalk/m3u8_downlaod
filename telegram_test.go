@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -52,29 +53,61 @@ func TestTelegramSettingsParseAndHideToken(t *testing.T) {
 	}
 }
 
-func TestTelegramSplitFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "video.mp4")
-	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+func TestTelegramSegmentDurationUsesTargetSizeRatio(t *testing.T) {
+	if got := telegramSegmentDuration(1_000, 100, 225); got != 22.5 {
+		t.Fatalf("segment duration = %f, want 22.5", got)
+	}
+	if got := telegramSegmentDuration(1_000, 100, 1); got != 1 {
+		t.Fatalf("minimum segment duration = %f, want 1", got)
+	}
+}
+
+func TestTelegramSegmentArgumentsProducePlayableMP4(t *testing.T) {
+	arguments := strings.Join(telegramSegmentArguments("input.mp4", "segments/part-%03d.mp4", 22.5), " ")
+	for _, expected := range []string{"-c copy", "-f segment", "-segment_time 22.500", "-reset_timestamps 1", "-segment_format mp4", "-segment_format_options movflags=+faststart"} {
+		if !strings.Contains(arguments, expected) {
+			t.Fatalf("segment arguments missing %q: %s", expected, arguments)
+		}
+	}
+}
+
+func TestSplitTelegramVideoCreatesPlayableMP4Segments(t *testing.T) {
+	const ffmpegPath = "H:/video/ffmpeg.exe"
+	if _, err := exec.LookPath(ffmpegPath); err != nil {
+		t.Skip("本机未安装用于集成测试的 FFmpeg")
+	}
+	previous := ffmpegPathOverride
+	ffmpegPathOverride = ffmpegPath
+	t.Cleanup(func() { ffmpegPathOverride = previous })
+	directory := t.TempDir()
+	inputPath := filepath.Join(directory, "source.mp4")
+	command := exec.Command(ffmpegPath, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=8:size=320x240:rate=30", "-f", "lavfi", "-i", "sine=duration=8", "-c:v", "mpeg4", "-c:a", "aac", "-shortest", inputPath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create test video: %v: %s", err, output)
+	}
+	info, err := os.Stat(inputPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	parts, cleanup, err := splitTelegramFile(path, 4)
+	parts, cleanup, err := splitTelegramVideo(inputPath, info.Size()/3, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	if len(parts) != 3 {
-		t.Fatalf("part count = %d, want 3", len(parts))
+	if len(parts) < 2 {
+		t.Fatalf("part count = %d, want at least 2", len(parts))
 	}
-	var joined strings.Builder
 	for _, part := range parts {
-		content, err := os.ReadFile(part)
+		partInfo, err := os.Stat(part)
 		if err != nil {
 			t.Fatal(err)
 		}
-		joined.Write(content)
-	}
-	if joined.String() != "0123456789" {
-		t.Fatalf("joined parts = %q", joined.String())
+		if partInfo.Size() > info.Size()/3 {
+			t.Fatalf("segment %s exceeds size limit: %d", part, partInfo.Size())
+		}
+		if duration, err := probeTelegramMediaDuration(context.Background(), part); err != nil || duration <= 0 {
+			t.Fatalf("segment %s is not independently playable: duration=%f, error=%v", part, duration, err)
+		}
 	}
 }
 
