@@ -260,10 +260,10 @@ func (s *telegramService) upload(identifier string, settings telegramSettings) {
 		for start := 0; start < len(parts); {
 			end := telegramMediaGroupEnd(start, len(parts))
 			if err := s.sendMediaGroup(context, settings, chatID, parts[start:end], current.OutputName, start+1, len(parts)); err != nil {
-				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
+				s.manager.addLog(identifier, "error", fmt.Sprintf("Telegram 视频相册上传失败（Chat %d，第 %d-%d 段）: %v", chatID, start+1, end, err))
 				return
 			}
-			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 相册文件段 %d-%d/%d 到 Chat %d", start+1, end, len(parts), chatID))
+			s.manager.addLog(identifier, "info", fmt.Sprintf("已上传 Telegram 视频相册文件段 %d-%d/%d 到 Chat %d", start+1, end, len(parts), chatID))
 			start = end
 		}
 	}
@@ -742,14 +742,14 @@ func writeTelegramMediaGroupForm(form *multipart.Writer, chatID int64, paths []s
 	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
-	type inputMediaDocument struct {
+	type inputMediaVideo struct {
 		Type    string `json:"type"`
 		Media   string `json:"media"`
 		Caption string `json:"caption,omitempty"`
 	}
-	media := make([]inputMediaDocument, 0, len(paths))
+	media := make([]inputMediaVideo, 0, len(paths))
 	for index := range paths {
-		item := inputMediaDocument{Type: "document", Media: fmt.Sprintf("attach://file%d", index)}
+		item := inputMediaVideo{Type: "video", Media: fmt.Sprintf("attach://file%d", index)}
 		if index == 0 {
 			item.Caption = fmt.Sprintf("%s (%d/%d)", outputName, startIndex, totalParts)
 		}

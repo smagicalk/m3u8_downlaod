@@ -152,7 +152,7 @@ func TestTelegramFileUploadStreamsMultipartContent(t *testing.T) {
 	}
 }
 
-func TestTelegramMediaGroupStreamsDocumentAlbum(t *testing.T) {
+func TestTelegramMediaGroupStreamsVideoAlbum(t *testing.T) {
 	directory := t.TempDir()
 	parts := []string{filepath.Join(directory, "video.part001"), filepath.Join(directory, "video.part002")}
 	for index, path := range parts {
@@ -178,7 +178,7 @@ func TestTelegramMediaGroupStreamsDocumentAlbum(t *testing.T) {
 		if err := json.Unmarshal([]byte(request.FormValue("media")), &media); err != nil {
 			t.Fatal(err)
 		}
-		if len(media) != 2 || media[0].Type != "document" || media[0].Media != "attach://file0" || media[1].Media != "attach://file1" || media[0].Caption != "video.mp4 (1/2)" || media[1].Caption != "" {
+		if len(media) != 2 || media[0].Type != "video" || media[0].Media != "attach://file0" || media[1].Media != "attach://file1" || media[0].Caption != "video.mp4 (1/2)" || media[1].Caption != "" {
 			t.Fatalf("media = %#v", media)
 		}
 		for index, field := range []string{"file0", "file1"} {
