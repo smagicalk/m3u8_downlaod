@@ -1,25 +1,21 @@
-name: 构建发布包
+name: 构建多系统发布包
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 要构建的分支或 tag
+        description: 源码分支或 tag，只需填写一个
         required: true
         default: dev
-        type: string
-      release_tag:
-        description: 要创建或更新的发布 tag，例如 v1.0.0
-        required: true
         type: string
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: 构建并上传发布包
-    runs-on: windows-latest
+  test:
+    name: 测试源码
+    runs-on: ubuntu-latest
     steps:
       - name: 检出指定源码
         uses: actions/checkout@v7
@@ -33,46 +29,136 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: 测试
-        shell: pwsh
+      - name: 运行测试
         run: go test ./...
 
-      - name: 构建 Windows 和 Linux 包
+  build:
+    name: 构建 ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: ubuntu-latest
+            runner: ubuntu-latest
+            verify_image: ubuntu:latest
+          - target: debian-13
+            runner: ubuntu-latest
+            verify_image: debian:13
+          - target: alpine-latest
+            runner: ubuntu-latest
+            verify_image: alpine:latest
+          - target: windows-latest
+            runner: windows-latest
+            verify_image: ''
+    steps:
+      - name: 检出指定源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: 构建并验证 Linux 包
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERIFY_IMAGE: ${{ matrix.verify_image }}
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binary="m3u8-downloader-${TARGET}-amd64"
+          go build -trimpath -ldflags '-s -w' -o "dist/${binary}" .
+          docker run --rm --volume "$PWD/dist:/work:ro" "$VERIFY_IMAGE" "/work/${binary}" -h >/dev/null 2>&1
+          tar -C dist -czf "dist/${binary}.tar.gz" "$binary"
+          rm "dist/${binary}"
+
+      - name: 构建 Windows 包
+        if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $env:CGO_ENABLED = '0'
-          $env:GOOS = 'windows'
-          $env:GOARCH = 'amd64'
-          go build -trimpath -ldflags '-s -w' -o dist/m3u8-downloader-windows-amd64.exe .
-          $env:GOOS = 'linux'
-          $env:GOARCH = 'amd64'
-          go build -trimpath -ldflags '-s -w' -o dist/m3u8-downloader
-          Compress-Archive -Path dist/m3u8-downloader-windows-amd64.exe -DestinationPath dist/m3u8-downloader-windows-amd64.zip -Force
-          Compress-Archive -Path dist/m3u8-downloader -DestinationPath dist/m3u8-downloader-linux-amd64.zip -Force
-          Get-FileHash dist/m3u8-downloader-windows-amd64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
-          Get-FileHash dist/m3u8-downloader-linux-amd64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Add-Content -Encoding ascii dist/SHA256SUMS.txt
+          $binary = 'm3u8-downloader-windows-latest-amd64.exe'
+          go build -trimpath -ldflags '-s -w' -o "dist/$binary" .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path "dist/$binary" -DestinationPath "dist/$binary.zip" -Force
+          Remove-Item -LiteralPath "dist/$binary"
 
-      - name: 上传工作流产物
+      - name: 上传系统产物
         uses: actions/upload-artifact@v4
         with:
-          name: m3u8-downloader-${{ inputs.release_tag }}
+          name: package-${{ matrix.target }}
           path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 汇总并发布
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出指定源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: 下载全部系统产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: 确定发布 tag 并生成校验文件
+        id: release
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet "refs/tags/${SOURCE_REF}^{commit}" >/dev/null; then
+            release_tag="$SOURCE_REF"
+          else
+            safe_ref="$(printf '%s' "$SOURCE_REF" | sed 's/[^A-Za-z0-9._-]/-/g')"
+            release_tag="build-${safe_ref}-${GITHUB_RUN_NUMBER}"
+          fi
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: 上传汇总产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3u8-downloader-${{ steps.release.outputs.release_tag }}
+          path: |
+            dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: 创建或更新 GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
         run: |
-          $commit = git rev-parse HEAD
-          $assets = @('dist/m3u8-downloader-windows-amd64.zip', 'dist/m3u8-downloader-linux-amd64.zip', 'dist/SHA256SUMS.txt')
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG @assets --clobber --repo $env:GITHUB_REPOSITORY
-          } else {
-            gh release create $env:RELEASE_TAG @assets --target $commit --title $env:RELEASE_TAG --generate-notes --repo $env:GITHUB_REPOSITORY
-          }
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt)
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --target "$commit" --title "$RELEASE_TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

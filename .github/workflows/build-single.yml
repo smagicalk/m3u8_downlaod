@@ -1,0 +1,89 @@
+name: 测试单系统编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 源码分支或 tag，只需填写一个
+        required: true
+        default: dev
+        type: string
+      target:
+        description: 只编译并验证这个系统
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - debian-13
+          - alpine-latest
+          - windows-latest
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 测试 ${{ inputs.target }}
+    runs-on: ${{ inputs.target == 'windows-latest' && 'windows-latest' || 'ubuntu-latest' }}
+    steps:
+      - name: 检出指定源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: 运行测试
+        run: go test ./...
+
+      - name: 构建并验证 Linux 包
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ inputs.target }}
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            ubuntu-latest) verify_image='ubuntu:latest' ;;
+            debian-13) verify_image='debian:13' ;;
+            alpine-latest) verify_image='alpine:latest' ;;
+            *) echo "不支持的 Linux 目标: $TARGET" >&2; exit 1 ;;
+          esac
+          mkdir -p dist
+          binary="m3u8-downloader-${TARGET}-amd64"
+          go build -trimpath -ldflags '-s -w' -o "dist/${binary}" .
+          docker run --rm --volume "$PWD/dist:/work:ro" "$verify_image" "/work/${binary}" -h >/dev/null 2>&1
+          tar -C dist -czf "dist/${binary}.tar.gz" "$binary"
+          rm "dist/${binary}"
+
+      - name: 构建 Windows 包
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $binary = 'm3u8-downloader-windows-latest-amd64.exe'
+          go build -trimpath -ldflags '-s -w' -o "dist/$binary" .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path "dist/$binary" -DestinationPath "dist/$binary.zip" -Force
+          Remove-Item -LiteralPath "dist/$binary"
+
+      - name: 上传测试产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ inputs.target }}-${{ github.run_number }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
