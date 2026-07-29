@@ -81,7 +81,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: 汇总并发布
+    name: 汇总产物并按需发布
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -98,25 +98,31 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: 确定发布 tag 并生成校验文件
+      - name: 识别源码类型并生成校验文件
         id: release
         env:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           if git rev-parse --verify --quiet "refs/tags/${SOURCE_REF}^{commit}" >/dev/null; then
+            is_tag='true'
             release_tag="$SOURCE_REF"
+            artifact_label="$SOURCE_REF"
           else
+            is_tag='false'
+            release_tag=''
             safe_ref="$(printf '%s' "$SOURCE_REF" | sed 's/[^A-Za-z0-9._-]/-/g')"
-            release_tag="build-${safe_ref}-${GITHUB_RUN_NUMBER}"
+            artifact_label="$safe_ref"
           fi
           (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+          echo "is_tag=$is_tag" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "artifact_label=$artifact_label" >> "$GITHUB_OUTPUT"
 
       - name: 上传汇总产物
         uses: actions/upload-artifact@v4
         with:
-          name: m3u8-downloader-${{ steps.release.outputs.release_tag }}
+          name: m3u8-downloader-${{ steps.release.outputs.artifact_label }}
           path: |
             dist/*.tar.gz
             dist/*.zip
@@ -124,6 +130,7 @@ jobs:
           if-no-files-found: error
 
       - name: 创建或更新 GitHub Release
+        if: steps.release.outputs.is_tag == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}

@@ -80,7 +80,7 @@ SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会�
 
 仓库提供三个仅可在 Actions 页面手动运行的工作流：
 
-- “构建多系统发布包”：只需填写一个源码分支或 tag；它会构建 Ubuntu latest、Debian 13、Alpine latest 和 Windows latest 的 AMD64 压缩包，并创建或更新 GitHub Release。
+- “构建多系统发布包”：只需填写一个源码分支或 tag；它会构建 Ubuntu latest、Debian 13、Alpine latest 和 Windows latest 的 AMD64 压缩包。选择分支时只上传 Actions Artifact，不创建任何 tag 或 Release；选择仓库中已有的 tag 时才创建或更新同名 GitHub Release。
 - “编译单系统包”：选择一个系统，只编译并上传该系统的工作流产物，不创建 Release。
 - “发布 Docker 镜像”：默认读取最新 GitHub Release tag 的 `m3u8-downloader-alpine-latest-amd64.tar.gz`，不在镜像构建阶段重新编译。镜像基于 Alpine latest，内置 FFmpeg、FFprobe、CA 证书和时区数据；上传至 `ghcr.io/smagicalk/m3u8_downlaod`，同时标记该发布 tag 和 `latest`。
 
