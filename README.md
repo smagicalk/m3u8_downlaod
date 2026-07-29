@@ -78,9 +78,23 @@ SQLite 数据库默认保存在 `data/m3u8-downloader.db`，首次启动时会�
 
 ## GitHub 发布
 
-仓库提供两个仅可在 Actions 页面手动运行的工作流：
+仓库提供三个仅可在 Actions 页面手动运行的工作流：
 
-- “构建发布包”：填写源码分支或 tag 与目标发布 tag。它会测试代码，构建 Windows 和 Linux AMD64 压缩包，上传工作流产物，并创建或更新同名 GitHub Release。
-- “发布 Docker 镜像”：默认读取最新 GitHub Release tag 的 `m3u8-downloader-linux-amd64.zip`，不在镜像构建阶段重新编译。镜像上传至 `ghcr.io/smagicalk/m3u8_downlaod`，同时标记该发布 tag 和 `latest`。
+- “构建多系统发布包”：只需填写一个源码分支或 tag；它会构建 Ubuntu latest、Debian 13、Alpine latest 和 Windows latest 的 AMD64 压缩包，并创建或更新 GitHub Release。
+- “编译单系统包”：选择一个系统，只编译并上传该系统的工作流产物，不创建 Release。
+- “发布 Docker 镜像”：默认读取最新 GitHub Release tag 的 `m3u8-downloader-alpine-latest-amd64.tar.gz`，不在镜像构建阶段重新编译。镜像基于 Alpine latest，内置 FFmpeg、FFprobe、CA 证书和时区数据；上传至 `ghcr.io/smagicalk/m3u8_downlaod`，同时标记该发布 tag 和 `latest`。
 
-首次推送镜像前，请在仓库 Actions 设置中允许工作流拥有 `Read and write permissions`，并确认 GitHub Packages 对仓库可写。运行容器时持久化挂载 `/app/data`、`/app/downloads` 和 `/app/cache`；容器会监听 `8080` 端口，并已内置 FFmpeg。
+首次推送镜像前，请在仓库 Actions 设置中允许工作流拥有 `Read and write permissions`，并确认 GitHub Packages 对仓库可写。可直接启动镜像：
+
+```bash
+docker run -d --name m3u8-downloader --restart unless-stopped \
+  -p 8080:8080 \
+  -e TZ=Asia/Shanghai \
+  -e M3U8_ADMIN_PASSWORD='请设置至少8位的强密码' \
+  -v m3u8-data:/app/data \
+  -v m3u8-downloads:/app/downloads \
+  -v m3u8-cache:/app/cache \
+  ghcr.io/smagicalk/m3u8_downlaod:latest
+```
+
+Docker 镜像不包含 Telegram Bot API Server。请单独部署 Bot API，并在网页设置中填写容器可访问的地址；如果两个容器位于同一个 Docker 网络，可使用类似 `http://telegram-bot-api:8081` 的地址，不要填写下载器容器自身的 `127.0.0.1`。

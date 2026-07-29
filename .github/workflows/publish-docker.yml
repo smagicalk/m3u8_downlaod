@@ -21,7 +21,7 @@ jobs:
       - name: 检出 Docker 构建定义
         uses: actions/checkout@v7
 
-      - name: 下载最新 tag 的 Debian 13 发布包
+      - name: 下载最新 tag 的 Alpine 发布包
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,11 +34,11 @@ jobs:
           fi
           test -n "$release_tag"
           mkdir -p release dist
-          asset='m3u8-downloader-debian-13-amd64.tar.gz'
+          asset='m3u8-downloader-alpine-latest-amd64.tar.gz'
           gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --pattern 'SHA256SUMS.txt' --dir release
           grep "  $asset$" release/SHA256SUMS.txt | (cd release && sha256sum -c -)
           tar -xzf "release/$asset" -C dist
-          mv dist/m3u8-downloader-debian-13-amd64 dist/m3u8-downloader
+          mv dist/m3u8-downloader-alpine-latest-amd64 dist/m3u8-downloader
           chmod 0755 dist/m3u8-downloader
           image_tag="$(printf '%s' "$release_tag" | tr '/' '-')"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"

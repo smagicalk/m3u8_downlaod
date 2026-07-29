@@ -1,8 +1,6 @@
-FROM debian:bookworm-slim
+FROM alpine:latest
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates ffmpeg tzdata
 
 WORKDIR /app
 
