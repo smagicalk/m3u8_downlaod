@@ -1,9 +1,27 @@
 services:
+  telegram-bot-api:
+    image: evilfreelancer/docker-telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    init: true
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?请设置 TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?请设置 TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "true"
+    ports:
+      - "${TELEGRAM_BOT_API_BIND:-127.0.0.1}:${TELEGRAM_BOT_API_PORT:-8081}:8081"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - downloads:/app/downloads:ro
+      - cache:/app/cache:ro
+
   m3u8-downloader:
     image: ${M3U8_IMAGE:-ghcr.io/smagicalk/m3u8_downlaod}:${M3U8_IMAGE_TAG:-latest}
     container_name: m3u8-downloader
     restart: unless-stopped
     init: true
+    depends_on:
+      - telegram-bot-api
     ports:
       - "${M3U8_PORT:-8080}:8080"
     environment:
@@ -26,3 +44,5 @@ volumes:
     name: ${M3U8_DOWNLOADS_VOLUME:-m3u8-downloads}
   cache:
     name: ${M3U8_CACHE_VOLUME:-m3u8-cache}
+  telegram-bot-api-data:
+    name: ${TELEGRAM_BOT_API_DATA_VOLUME:-telegram-bot-api-data}

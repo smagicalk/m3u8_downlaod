@@ -98,9 +98,17 @@ docker run -d --name m3u8-downloader --restart unless-stopped \
   ghcr.io/smagicalk/m3u8_downlaod:latest
 ```
 
-Docker 镜像不包含 Telegram Bot API Server。请单独部署 Bot API，并确保两个容器位于同一个 Docker 网络。`TELEGRAM_BOT_API_URL` 的镜像默认值为 `http://telegram-bot-api:8081`，可按 Bot API 容器的服务名覆盖；该变量只用于首次初始化，网页中已保存的地址优先。不要填写下载器容器自身的 `127.0.0.1`。
+下载器镜像本身不包含 Telegram Bot API Server。单独使用 `docker run` 时，请另行部署 Bot API，并确保两个容器位于同一个 Docker 网络。`TELEGRAM_BOT_API_URL` 的镜像默认值为 `http://telegram-bot-api:8081`，可按 Bot API 容器的服务名覆盖；该变量只用于首次初始化，网页中已保存的地址优先。不要填写下载器容器自身的 `127.0.0.1`。
 
-也可以直接使用仓库中的 Compose 配置：
+推荐直接使用仓库中的 Compose 配置，它会同时启动 `evilfreelancer/docker-telegram-bot-api:latest`。先在项目目录创建 `.env` 并填写从 Telegram 获取的应用凭据，不要将该文件提交到 Git：
+
+```dotenv
+TELEGRAM_API_ID=你的_API_ID
+TELEGRAM_API_HASH=你的_API_HASH
+M3U8_ADMIN_PASSWORD=请设置至少8位的强密码
+```
+
+然后启动服务：
 
 ```bash
 docker compose pull
@@ -108,10 +116,6 @@ docker compose up -d
 docker compose logs m3u8-downloader
 ```
 
-Compose 默认创建 `m3u8-network` 网络和三个持久化卷，并使用 `http://telegram-bot-api:8081` 作为首次 Bot API 地址。如果 Bot API 已作为其他容器运行，可将它接入同一网络：
+Compose 默认创建 `m3u8-network` 网络、下载器的三个持久化卷和 Bot API 数据卷，并使用 `http://telegram-bot-api:8081` 作为首次 Bot API 地址。下载卷和缓存卷会以只读方式挂载到 Bot API 容器的相同路径，以支持本地文件上传。Bot API 的宿主机端口默认只监听 `127.0.0.1:8081`。
 
-```bash
-docker network connect m3u8-network telegram-bot-api
-```
-
-未设置 `M3U8_ADMIN_PASSWORD` 时，首次登录临时密码会显示在 `docker compose logs m3u8-downloader` 中。端口、镜像 Tag、网络、密码和 Bot API 地址均可通过同名环境变量或 `.env` 文件覆盖。
+未设置 `M3U8_ADMIN_PASSWORD` 时，首次登录临时密码会显示在 `docker compose logs m3u8-downloader` 中。端口、镜像 Tag、网络、密码和 Bot API 地址均可通过同名环境变量或 `.env` 文件覆盖；可通过 `TELEGRAM_BOT_API_BIND`、`TELEGRAM_BOT_API_PORT` 和 `TELEGRAM_BOT_API_DATA_VOLUME` 调整 Bot API 的监听地址、端口及数据卷名称。
