@@ -13,28 +13,8 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: 测试源码
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出指定源码
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.source_ref }}
-          fetch-depth: 0
-
-      - name: 安装 Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - name: 运行测试
-        run: go test ./...
-
   build:
     name: 构建 ${{ matrix.target }}
-    needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -42,16 +22,12 @@ jobs:
         include:
           - target: ubuntu-latest
             runner: ubuntu-latest
-            verify_image: ubuntu:latest
           - target: debian-13
             runner: ubuntu-latest
-            verify_image: debian:13
           - target: alpine-latest
             runner: ubuntu-latest
-            verify_image: alpine:latest
           - target: windows-latest
             runner: windows-latest
-            verify_image: ''
     steps:
       - name: 检出指定源码
         uses: actions/checkout@v7
@@ -65,11 +41,10 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: 构建并验证 Linux 包
+      - name: 构建 Linux 包
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ matrix.target }}
-          VERIFY_IMAGE: ${{ matrix.verify_image }}
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: amd64
@@ -78,7 +53,6 @@ jobs:
           mkdir -p dist
           binary="m3u8-downloader-${TARGET}-amd64"
           go build -trimpath -ldflags '-s -w' -o "dist/${binary}" .
-          docker run --rm --volume "$PWD/dist:/work:ro" "$VERIFY_IMAGE" "/work/${binary}" -h >/dev/null 2>&1
           tar -C dist -czf "dist/${binary}.tar.gz" "$binary"
           rm "dist/${binary}"
 

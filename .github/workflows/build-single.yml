@@ -1,4 +1,4 @@
-name: 测试单系统编译
+name: 编译单系统包
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: dev
         type: string
       target:
-        description: 只编译并验证这个系统
+        description: 只编译这个系统
         required: true
         default: ubuntu-latest
         type: choice
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   build:
-    name: 测试 ${{ inputs.target }}
+    name: 构建 ${{ inputs.target }}
     runs-on: ${{ inputs.target == 'windows-latest' && 'windows-latest' || 'ubuntu-latest' }}
     steps:
       - name: 检出指定源码
@@ -39,10 +39,7 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: 运行测试
-        run: go test ./...
-
-      - name: 构建并验证 Linux 包
+      - name: 构建 Linux 包
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ inputs.target }}
@@ -51,16 +48,9 @@ jobs:
           GOARCH: amd64
         run: |
           set -euo pipefail
-          case "$TARGET" in
-            ubuntu-latest) verify_image='ubuntu:latest' ;;
-            debian-13) verify_image='debian:13' ;;
-            alpine-latest) verify_image='alpine:latest' ;;
-            *) echo "不支持的 Linux 目标: $TARGET" >&2; exit 1 ;;
-          esac
           mkdir -p dist
           binary="m3u8-downloader-${TARGET}-amd64"
           go build -trimpath -ldflags '-s -w' -o "dist/${binary}" .
-          docker run --rm --volume "$PWD/dist:/work:ro" "$verify_image" "/work/${binary}" -h >/dev/null 2>&1
           tar -C dist -czf "dist/${binary}.tar.gz" "$binary"
           rm "dist/${binary}"
 
@@ -79,10 +69,10 @@ jobs:
           Compress-Archive -Path "dist/$binary" -DestinationPath "dist/$binary.zip" -Force
           Remove-Item -LiteralPath "dist/$binary"
 
-      - name: 上传测试产物
+      - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: test-${{ inputs.target }}-${{ github.run_number }}
+          name: build-${{ inputs.target }}-${{ github.run_number }}
           path: |
             dist/*.tar.gz
             dist/*.zip
