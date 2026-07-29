@@ -1,0 +1,28 @@
+services:
+  m3u8-downloader:
+    image: ${M3U8_IMAGE:-ghcr.io/smagicalk/m3u8_downlaod}:${M3U8_IMAGE_TAG:-latest}
+    container_name: m3u8-downloader
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${M3U8_PORT:-8080}:8080"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      M3U8_ADMIN_PASSWORD: ${M3U8_ADMIN_PASSWORD:-}
+      TELEGRAM_BOT_API_URL: ${TELEGRAM_BOT_API_URL:-http://telegram-bot-api:8081}
+    volumes:
+      - data:/app/data
+      - downloads:/app/downloads
+      - cache:/app/cache
+
+networks:
+  default:
+    name: ${M3U8_NETWORK:-m3u8-network}
+
+volumes:
+  data:
+    name: ${M3U8_DATA_VOLUME:-m3u8-data}
+  downloads:
+    name: ${M3U8_DOWNLOADS_VOLUME:-m3u8-downloads}
+  cache:
+    name: ${M3U8_CACHE_VOLUME:-m3u8-cache}
