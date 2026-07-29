@@ -56,6 +56,34 @@ func TestTelegramSettingsParseAndHideToken(t *testing.T) {
 	}
 }
 
+func TestTelegramAPIURLDefaultsFromEnvironmentWithoutOverwritingSavedValue(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_API_URL", "http://telegram-bot-api:8081/")
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	settings, err := storage.loadTelegramSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.APIBaseURL != "http://telegram-bot-api:8081" {
+		t.Fatalf("environment API URL = %q", settings.APIBaseURL)
+	}
+	settings.APIBaseURL = "http://custom-bot-api:9000"
+	if err := storage.saveTelegramSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TELEGRAM_BOT_API_URL", "http://another-default:8081")
+	settings, err = storage.loadTelegramSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.APIBaseURL != "http://custom-bot-api:9000" {
+		t.Fatalf("saved API URL was overwritten: %q", settings.APIBaseURL)
+	}
+}
+
 func TestTelegramSegmentDurationUsesTargetSizeRatio(t *testing.T) {
 	if got := telegramSegmentDuration(1_000, 100, 225); got != 22.5 {
 		t.Fatalf("segment duration = %f, want 22.5", got)

@@ -14,6 +14,8 @@ import (
 )
 
 const databaseFileName = "m3u8-downloader.db"
+const telegramBotAPIURLEnv = "TELEGRAM_BOT_API_URL"
+const defaultTelegramBotAPIURL = "http://127.0.0.1:8081"
 
 type appSettings struct {
 	OutputDir           string `json:"outputDirectory"`
@@ -318,7 +320,11 @@ func (s *store) saveSettings(settings appSettings) error {
 }
 
 func defaultTelegramSettings() telegramSettings {
-	return telegramSettings{APIBaseURL: "http://127.0.0.1:8081", SplitSizeMB: 1900}
+	apiBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv(telegramBotAPIURLEnv)), "/")
+	if apiBaseURL == "" {
+		apiBaseURL = defaultTelegramBotAPIURL
+	}
+	return telegramSettings{APIBaseURL: apiBaseURL, SplitSizeMB: 1900}
 }
 
 func (s *store) loadTelegramSettings() (telegramSettings, error) {

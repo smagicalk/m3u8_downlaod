@@ -11,6 +11,7 @@ RUN chmod 0755 /app/m3u8-downloader \
 
 ENV ADDR=0.0.0.0:8080
 ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV TELEGRAM_BOT_API_URL=http://telegram-bot-api:8081
 
 VOLUME ["/app/cache", "/app/data", "/app/downloads"]
 

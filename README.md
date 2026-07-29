@@ -91,10 +91,11 @@ docker run -d --name m3u8-downloader --restart unless-stopped \
   -p 8080:8080 \
   -e TZ=Asia/Shanghai \
   -e M3U8_ADMIN_PASSWORD='请设置至少8位的强密码' \
+  -e TELEGRAM_BOT_API_URL='http://telegram-bot-api:8081' \
   -v m3u8-data:/app/data \
   -v m3u8-downloads:/app/downloads \
   -v m3u8-cache:/app/cache \
   ghcr.io/smagicalk/m3u8_downlaod:latest
 ```
 
-Docker 镜像不包含 Telegram Bot API Server。请单独部署 Bot API，并在网页设置中填写容器可访问的地址；如果两个容器位于同一个 Docker 网络，可使用类似 `http://telegram-bot-api:8081` 的地址，不要填写下载器容器自身的 `127.0.0.1`。
+Docker 镜像不包含 Telegram Bot API Server。请单独部署 Bot API，并确保两个容器位于同一个 Docker 网络。`TELEGRAM_BOT_API_URL` 的镜像默认值为 `http://telegram-bot-api:8081`，可按 Bot API 容器的服务名覆盖；该变量只用于首次初始化，网页中已保存的地址优先。不要填写下载器容器自身的 `127.0.0.1`。
