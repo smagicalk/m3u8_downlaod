@@ -68,8 +68,8 @@
     .badge.cancelled { background: #ece6dc; color: #6f5b3e; }
     .action { min-height: 34px; background: transparent; border: 1px solid #9eafb8; color: #34434a; padding: 0 10px; }
     .action:hover { background: #e5ecef; }
-    .cancel { color: #b42318; border-color: #d6a5a0; }
-    .cancel:hover { background: #fde4e1; }
+    .cancel, .danger { color: #b42318; border-color: #d6a5a0; }
+    .cancel:hover, .danger:hover { background: #fde4e1; }
     a { color: #056b4c; }
     @media (max-width: 720px) { main { width: min(100% - 24px, 980px); padding-top: 28px; } header { align-items: start; flex-direction: column; gap: 8px; } .primary-row, .request-grid, .detail-meta { grid-template-columns: 1fr; } .field-wide { grid-column: auto; } .task { grid-template-columns: 1fr; gap: 10px; } .state { justify-content: space-between; } .header-actions { flex-wrap: wrap; } .log-output { height: 300px; } }
   </style>
@@ -198,23 +198,25 @@
       return item.durationSec ? Math.min(100, Math.max(0, item.progressSec / item.durationSec * 100)) : 0;
     }
 
-    function taskActions(item) {
+    function taskActions(item, includeDelete = false) {
       const pause = item.status === 'running' ? `<button class="action" type="button" data-action="pause" data-id="${item.id}">暂停</button>` : '';
       const resume = item.status === 'paused' ? `<button class="action" type="button" data-action="resume" data-id="${item.id}">继续</button>` : '';
       const cancel = ['queued', 'running', 'paused'].includes(item.status) ? `<button class="action cancel" type="button" data-action="cancel" data-id="${item.id}">取消</button>` : '';
-      const upload = item.status === 'completed' ? `<button class="action" type="button" data-action="telegram-upload" data-id="${item.id}">上传 TG</button>` : '';
-      return `${pause}${resume}${cancel}${upload}`;
+      const upload = item.status === 'completed' && item.outputAvailable ? `<button class="action" type="button" data-action="telegram-upload" data-id="${item.id}">上传 TG</button>` : '';
+      const deleteOutput = includeDelete && item.outputAvailable ? `<button class="action danger" type="button" data-action="delete-output" data-id="${item.id}">删除视频</button>` : '';
+      const deleteTask = includeDelete && ['completed', 'failed', 'cancelled'].includes(item.status) ? `<button class="action danger" type="button" data-action="delete-task" data-id="${item.id}">删除任务</button>` : '';
+      return `${pause}${resume}${cancel}${upload}${deleteOutput}${deleteTask}`;
     }
 
     function renderDetail(item) {
       const previousOutput = taskDetail.querySelector('.log-output');
       const previousScrollTop = previousOutput?.scrollTop || 0;
       const shouldFollow = !previousOutput || previousOutput.scrollHeight - previousOutput.clientHeight - previousScrollTop < 24;
-      const download = item.status === 'completed' ? `<a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
+      const download = item.outputAvailable ? `<a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
       const stateLabel = item.status === 'paused' ? '已暂停' : labels[item.status];
       const error = item.error ? `<div class="meta">${escapeHTML(item.error)}</div>` : '';
       const logs = item.logs?.map((entry) => `<div class="task-log-line ${escapeHTML(entry.level)}"><span class="task-log-time">${formatLogTime(entry.at)}</span>${escapeHTML(entry.message)}</div>`).join('') || '';
-      taskDetail.innerHTML = `<div class="detail-toolbar"><button class="detail-back" type="button" data-action="back" aria-label="返回任务列表" title="返回任务列表">&#8592;</button><h2 id="detail-heading">${escapeHTML(item.outputName)}</h2><span class="badge ${item.status}">${stateLabel}</span></div><div class="detail-summary"><div class="meta">${formatProgress(item)} · ${download}</div><div class="progress" aria-label="下载进度"><span style="width: ${taskPercent(item)}%"></span></div>${error}<div class="detail-meta"><span>保存目录：${escapeHTML(item.outputDirectory)}</span><span>缓存目录：${escapeHTML(item.cacheDirectory || '未设置')}</span><span>分片并发：${item.workerCount}</span><span>缓存清理：${item.deleteCache ? '合并后删除' : '保留'}</span></div><div class="state">${taskActions(item)}</div></div><div class="log-output" role="log" aria-live="polite">${logs}</div>`;
+      taskDetail.innerHTML = `<div class="detail-toolbar"><button class="detail-back" type="button" data-action="back" aria-label="返回任务列表" title="返回任务列表">&#8592;</button><h2 id="detail-heading">${escapeHTML(item.outputName)}</h2><span class="badge ${item.status}">${stateLabel}</span></div><div class="detail-summary"><div class="meta">${formatProgress(item)} · ${download}</div><div class="progress" aria-label="下载进度"><span style="width: ${taskPercent(item)}%"></span></div>${error}<div class="detail-meta"><span>保存目录：${escapeHTML(item.outputDirectory)}</span><span>缓存目录：${escapeHTML(item.cacheDirectory || '未设置')}</span><span>分片并发：${item.workerCount}</span><span>缓存清理：${item.deleteCache ? '合并后删除' : '保留'}</span></div><div class="state">${taskActions(item, true)}</div></div><div class="log-output" role="log" aria-live="polite">${logs}</div>`;
       const output = taskDetail.querySelector('.log-output');
       output.scrollTop = shouldFollow ? output.scrollHeight : previousScrollTop;
     }
@@ -244,7 +246,7 @@
       }
       tasks.className = '';
       tasks.innerHTML = items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).map((item) => {
-        const download = item.status === 'completed' ? ` · <a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
+        const download = item.outputAvailable ? ` · <a href="/api/tasks/${item.id}/download" download>获取文件</a>` : '';
         const error = item.error ? ` · ${escapeHTML(item.error)}` : '';
         const percent = taskPercent(item);
         const stateLabel = item.status === 'paused' ? '已暂停' : labels[item.status];
@@ -331,7 +333,14 @@
       const { action, id } = event.target.dataset;
       if (action === 'back') { selectedTaskID = null; await refresh(); return; }
       if (!action || !id) return;
-      try { await request(`/api/tasks/${id}/${action}`, { method: 'POST' }); await refresh(); }
+      if (action === 'delete-output' && !window.confirm('确定删除视频文件吗？任务记录和日志会保留。')) return;
+      if (action === 'delete-task' && !window.confirm('确定删除该任务吗？视频文件、任务缓存、任务记录和日志都会删除。')) return;
+      try {
+        if (action === 'delete-output') await request(`/api/tasks/${id}/output`, { method: 'DELETE' });
+        else if (action === 'delete-task') { await request(`/api/tasks/${id}`, { method: 'DELETE' }); selectedTaskID = null; }
+        else await request(`/api/tasks/${id}/${action}`, { method: 'POST' });
+        await refresh();
+      }
       catch (error) { notice.textContent = error.message; }
     });
 

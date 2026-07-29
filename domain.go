@@ -33,6 +33,7 @@ type task struct {
 	WorkerCount       int        `json:"workerCount"`
 	CacheKey          string     `json:"-"`
 	OutputPath        string     `json:"-"`
+	OutputAvailable   bool       `json:"outputAvailable"`
 	Status            taskStatus `json:"status"`
 	CompletedSegments int        `json:"completedSegments"`
 	TotalSegments     int        `json:"totalSegments"`

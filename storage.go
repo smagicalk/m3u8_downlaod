@@ -432,6 +432,32 @@ ON CONFLICT(id) DO UPDATE SET
 	return err
 }
 
+func (s *store) deleteTask(identifier string) (bool, error) {
+	transaction, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.Exec(`DELETE FROM task_logs WHERE task_id = ?`, identifier); err != nil {
+		return false, err
+	}
+	result, err := transaction.Exec(`DELETE FROM tasks WHERE id = ?`, identifier)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := transaction.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *store) saveTaskLog(identifier string, sequence int, entry taskLog) error {
 	transaction, err := s.db.Begin()
 	if err != nil {

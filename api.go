@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"os/exec"
@@ -198,8 +199,42 @@ func registerTaskRoutes(mux *http.ServeMux, manager *taskManager, telegram *tele
 		}
 		http.ServeFile(writer, request, current.OutputPath)
 	})
+	mux.HandleFunc("DELETE /api/tasks/{id}/output", func(writer http.ResponseWriter, request *http.Request) {
+		identifier := request.PathValue("id")
+		if telegram.isUploading(identifier) {
+			writeError(writer, http.StatusConflict, "任务正在上传到 Telegram，无法删除视频")
+			return
+		}
+		if err := manager.deleteOutput(identifier); err != nil {
+			writeTaskDeleteError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, manager.snapshot(identifier))
+	})
+	mux.HandleFunc("DELETE /api/tasks/{id}", func(writer http.ResponseWriter, request *http.Request) {
+		identifier := request.PathValue("id")
+		if telegram.isUploading(identifier) {
+			writeError(writer, http.StatusConflict, "任务正在上传到 Telegram，无法删除任务")
+			return
+		}
+		if err := manager.deleteTask(identifier); err != nil {
+			writeTaskDeleteError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]bool{"ok": true})
+	})
 	mux.HandleFunc("GET /api/proxy/{id}/playlist.m3u8", manager.servePlaylistProxy)
 	mux.HandleFunc("GET /api/proxy/{id}/resource/{name}", manager.serveResourceProxy)
+}
+
+func writeTaskDeleteError(writer http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, errTaskNotFound) || errors.Is(err, errOutputMissing) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, errTaskNotEnded) {
+		status = http.StatusConflict
+	}
+	writeError(writer, status, err.Error())
 }
 
 func decodeJSONBody(writer http.ResponseWriter, request *http.Request, limit int64, target any) error {

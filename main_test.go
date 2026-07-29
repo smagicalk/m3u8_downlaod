@@ -309,6 +309,76 @@ func TestExpiredStoppedTaskCacheIsRemoved(t *testing.T) {
 	}
 }
 
+func TestDeleteCompletedTaskOutputAndRecord(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	outputDirectory, cacheDirectory := t.TempDir(), t.TempDir()
+	outputPath := filepath.Join(outputDirectory, "video.mp4")
+	cachePath := filepath.Join(cacheDirectory, "hls-cache-key")
+	if err := os.WriteFile(outputPath, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cachePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "segment.ts"), []byte("cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	current := &task{ID: "task-1", OutputName: "video.mp4", OutputDir: outputDirectory, OutputPath: outputPath, CacheDir: cacheDirectory, CacheKey: "cache-key", Status: statusCompleted, CreatedAt: now, FinishedAt: &now}
+	appendTaskLog(current, "info", "任务已完成")
+	if err := storage.saveTask(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.saveTaskLog(current.ID, current.LogSequence, current.Logs[0]); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTaskManagerWithStore(appSettings{OutputDir: outputDirectory, CacheDir: cacheDirectory, WorkerCount: 8}, storage)
+	manager.tasks[current.ID] = current
+
+	if snapshot := manager.snapshot(current.ID); snapshot == nil || !snapshot.OutputAvailable {
+		t.Fatalf("completed task output availability = %#v", snapshot)
+	}
+	if err := manager.deleteOutput(current.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted output still exists: %v", err)
+	}
+	if snapshot := manager.snapshot(current.ID); snapshot == nil || snapshot.OutputAvailable {
+		t.Fatalf("task must remain without output: %#v", snapshot)
+	}
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("output-only deletion removed cache: %v", err)
+	}
+
+	if err := os.WriteFile(outputPath, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.deleteTask(current.ID); err != nil {
+		t.Fatal(err)
+	}
+	if manager.snapshot(current.ID) != nil {
+		t.Fatal("deleted task remains in manager")
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("task deletion left output: %v", err)
+	}
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("task deletion left cache: %v", err)
+	}
+	items, err := storage.loadTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("deleted task remains in SQLite: %#v", items)
+	}
+}
+
 func TestTaskLogsAreBoundedAndCopied(t *testing.T) {
 	manager := newTaskManager(t.TempDir())
 	manager.tasks["test"] = &task{ID: "test"}

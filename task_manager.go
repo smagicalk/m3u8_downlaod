@@ -27,6 +27,12 @@ type taskManager struct {
 	onCompleted  func(*task)
 }
 
+var (
+	errTaskNotFound  = errors.New("任务不存在")
+	errTaskNotEnded  = errors.New("任务尚未结束，无法删除")
+	errOutputMissing = errors.New("视频文件不存在")
+)
+
 func newTaskManager(outputDir string) *taskManager {
 	defaults, err := defaultSettings()
 	if err == nil {
@@ -451,26 +457,99 @@ func (m *taskManager) finish(identifier string, status taskStatus, message strin
 
 func (m *taskManager) snapshot(identifier string) *task {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	current := m.tasks[identifier]
 	if current == nil {
+		m.mu.RUnlock()
 		return nil
 	}
 	copy := *current
 	copy.Logs = append([]taskLog(nil), current.Logs...)
+	m.mu.RUnlock()
+	copy.OutputAvailable = taskOutputAvailable(&copy)
 	return &copy
 }
 
 func (m *taskManager) all() []*task {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	items := make([]*task, 0, len(m.tasks))
 	for _, current := range m.tasks {
 		copy := *current
 		copy.Logs = append([]taskLog(nil), current.Logs...)
 		items = append(items, &copy)
 	}
+	m.mu.RUnlock()
+	for _, current := range items {
+		current.OutputAvailable = taskOutputAvailable(current)
+	}
 	return items
+}
+
+func taskOutputAvailable(current *task) bool {
+	if current == nil || current.OutputPath == "" {
+		return false
+	}
+	info, err := os.Stat(current.OutputPath)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func taskEnded(status taskStatus) bool {
+	return status == statusCompleted || status == statusFailed || status == statusCancelled
+}
+
+func (m *taskManager) deleteOutput(identifier string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.tasks[identifier]
+	if current == nil {
+		return errTaskNotFound
+	}
+	if !taskEnded(current.Status) {
+		return errTaskNotEnded
+	}
+	if err := os.Remove(current.OutputPath); errors.Is(err, os.ErrNotExist) {
+		return errOutputMissing
+	} else if err != nil {
+		return fmt.Errorf("删除视频文件失败: %w", err)
+	}
+	appendTaskLog(current, "info", "已删除视频文件")
+	m.persistLogLocked(current)
+	return nil
+}
+
+func (m *taskManager) deleteTask(identifier string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.tasks[identifier]
+	if current == nil {
+		return errTaskNotFound
+	}
+	if !taskEnded(current.Status) {
+		return errTaskNotEnded
+	}
+	if current.OutputPath != "" {
+		if err := os.Remove(current.OutputPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("删除视频文件失败: %w", err)
+		}
+	}
+	if current.CacheDir != "" && current.CacheKey != "" {
+		cachePath := filepath.Join(current.CacheDir, "hls-"+current.CacheKey)
+		if err := os.RemoveAll(cachePath); err != nil {
+			return fmt.Errorf("删除任务缓存失败: %w", err)
+		}
+	}
+	if m.store != nil {
+		deleted, err := m.store.deleteTask(identifier)
+		if err != nil {
+			return fmt.Errorf("删除任务记录失败: %w", err)
+		}
+		if !deleted {
+			return errTaskNotFound
+		}
+	}
+	delete(m.tasks, identifier)
+	delete(m.cancels, identifier)
+	delete(m.processes, identifier)
+	return nil
 }
 
 func (m *taskManager) cancel(identifier string) bool {

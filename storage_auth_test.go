@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -98,8 +99,8 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 	taskPageRequest := httptest.NewRequest(http.MethodGet, "/tasks/task-1", nil)
 	taskPageRequest.AddCookie(cookie)
 	handler.ServeHTTP(taskPage, taskPageRequest)
-	if taskPage.Code != http.StatusOK || !bytes.Contains(taskPage.Body.Bytes(), []byte(`id="task-log"`)) {
-		t.Fatalf("task page = %d, contains log view = %t", taskPage.Code, bytes.Contains(taskPage.Body.Bytes(), []byte(`id="task-log"`)))
+	if taskPage.Code != http.StatusOK || !bytes.Contains(taskPage.Body.Bytes(), []byte(`id="task-log"`)) || !bytes.Contains(taskPage.Body.Bytes(), []byte(`data-action="delete-output"`)) || !bytes.Contains(taskPage.Body.Bytes(), []byte(`data-action="delete-task"`)) {
+		t.Fatalf("task page = %d, missing log view or delete actions", taskPage.Code)
 	}
 	taskAPI := httptest.NewRecorder()
 	taskAPIRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/task-1", nil)
@@ -129,6 +130,54 @@ func TestAuthenticationProtectsAPIsAndInvalidatesOldPassword(t *testing.T) {
 	}
 	if response := login("ChangedPass123"); response.StatusCode != http.StatusOK {
 		t.Fatalf("new password status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+}
+
+func TestDeleteTaskAPIRoutesRejectActiveUpload(t *testing.T) {
+	storage, _, err := openStore(filepath.Join(t.TempDir(), databaseFileName), "InitialPass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.close() })
+	outputDirectory := t.TempDir()
+	outputPath := filepath.Join(outputDirectory, "video.mp4")
+	if err := os.WriteFile(outputPath, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	current := &task{ID: "task-1", OutputName: "video.mp4", OutputDir: outputDirectory, OutputPath: outputPath, CacheDir: t.TempDir(), Status: statusCompleted, CreatedAt: now, FinishedAt: &now}
+	if err := storage.saveTask(current); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTaskManagerWithStore(appSettings{OutputDir: outputDirectory, CacheDir: current.CacheDir, WorkerCount: 8}, storage)
+	manager.tasks[current.ID] = current
+	telegram, err := newTelegramService(storage, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	registerTaskRoutes(mux, manager, telegram)
+
+	telegram.uploading[current.ID] = struct{}{}
+	blocked := httptest.NewRecorder()
+	mux.ServeHTTP(blocked, httptest.NewRequest(http.MethodDelete, "/api/tasks/task-1/output", nil))
+	if blocked.Code != http.StatusConflict {
+		t.Fatalf("active upload deletion status = %d, want %d", blocked.Code, http.StatusConflict)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("active upload deletion removed output: %v", err)
+	}
+	delete(telegram.uploading, current.ID)
+
+	outputDeletion := httptest.NewRecorder()
+	mux.ServeHTTP(outputDeletion, httptest.NewRequest(http.MethodDelete, "/api/tasks/task-1/output", nil))
+	if outputDeletion.Code != http.StatusOK || manager.snapshot(current.ID) == nil || manager.snapshot(current.ID).OutputAvailable {
+		t.Fatalf("output deletion = %d: %s", outputDeletion.Code, outputDeletion.Body.String())
+	}
+	taskDeletion := httptest.NewRecorder()
+	mux.ServeHTTP(taskDeletion, httptest.NewRequest(http.MethodDelete, "/api/tasks/task-1", nil))
+	if taskDeletion.Code != http.StatusOK || manager.snapshot(current.ID) != nil {
+		t.Fatalf("task deletion = %d: %s", taskDeletion.Code, taskDeletion.Body.String())
 	}
 }
 
